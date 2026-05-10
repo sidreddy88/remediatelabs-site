@@ -27,9 +27,30 @@ if (seeAlso.length) {
     .filter((p): p is NonNullable<typeof p> => p !== undefined)
     .map((p) => ({ slug: p.slug, data: p.data }));
 }
+
+const articleJsonLd = {
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  headline: title,
+  description: tagline,
+  datePublished: date.toISOString(),
+  author: {
+    "@type": "Person",
+    name: "Siddharth Sukumar",
+    url: "https://remediatelabs.io/about",
+  },
+  publisher: {
+    "@type": "Organization",
+    name: "Remediate Labs",
+    url: "https://remediatelabs.io",
+  },
+  keywords: tags.join(", "),
+  mainEntityOfPage: new URL(Astro.url.pathname, Astro.site).toString(),
+  image: new URL("/og-image.png", Astro.site).toString(),
+};
 ---
 
-<BaseLayout title={`${title} — Remediate Labs`} description={tagline}>
+<BaseLayout title={`${title} — Remediate Labs`} description={tagline} jsonLd={articleJsonLd}>
   <article class="container-prose pt-16 pb-12">
     <header class="mb-10 not-prose">
       <div class="flex items-center gap-3 text-xs text-muted mb-4">
