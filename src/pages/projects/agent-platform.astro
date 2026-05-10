@@ -1,6 +1,50 @@
 ---
 import BaseLayout from "../../layouts/BaseLayout.astro";
 import DemoCTA from "../../components/DemoCTA.astro";
+import Mermaid from "../../components/Mermaid.astro";
+
+const pipelineChart = `flowchart TB
+    A([CloudWatch alarm]) --> B[SNS topic]
+    B --> C[/webhooks/cloudwatch-alarm/]
+    C --> D{Dedup gate}
+    D -- duplicate --> X([drop])
+    D -- new --> E[TriageAgent · Haiku]
+    E -- noise --> X
+    E -- duplicate --> X
+    E -- real, P0–P3 --> F[DiagnosisAgent · Sonnet]
+    F --> G[FixGenerationAgent]
+    G --> H{Sandbox<br/>npm test}
+    H -- fail · retry 3× --> G
+    H -- pass --> I[CodeReviewAgent<br/>self-critique]
+    I --> J[Open GitHub PR]
+    J --> K{Risk}
+    K -- LOW/MED --> M[Auto-merge]
+    K -- HIGH/CRIT --> L[Human approval]
+    L --> M
+    M --> N[MonitorGenerationAgent<br/>new alarms for changed code]
+    classDef event fill:#0b0d10,stroke:#2f343b,color:#e6e8eb
+    classDef agent fill:#13161a,stroke:#6ee7b7,color:#e6e8eb
+    classDef gate fill:#0b0d10,stroke:#23272d,color:#9aa1a9
+    class A,X event
+    class E,F,G,I,N agent
+    class D,H,K gate`;
+
+const deploymentChart = `flowchart LR
+    U([User · Interviewer]) --> CF[Cloudflare<br/>edge]
+    CF --> ALB[AWS ALB<br/>:443]
+    ALB --> ECS[ECS Fargate task<br/>FastAPI + Uvicorn :8000]
+    ECS --> PG[(Postgres<br/>+ pgvector)]
+    ECS --> S3[(S3<br/>artefacts)]
+    GH[GitHub Actions OIDC] -. on push to main .-> ECR[ECR]
+    ECR -. ECS pull .-> ECS
+    SNS[SNS topic] --> WH[/webhook handler/]
+    CW[CloudWatch alarms] --> SNS
+    classDef ext fill:#0b0d10,stroke:#23272d,color:#9aa1a9
+    classDef compute fill:#13161a,stroke:#6ee7b7,color:#e6e8eb
+    classDef store fill:#13161a,stroke:#2f343b,color:#e6e8eb
+    class U,CF,GH ext
+    class ALB,ECS,WH compute
+    class PG,S3,ECR,SNS,CW store`;
 
 const stack = [
   { layer: "Agent runtime", value: "Anthropic SDK · Claude Opus 4.6 / Sonnet 4.6 / Haiku 4.5" },
@@ -51,37 +95,21 @@ const agents = [
   </section>
 
   <section class="container-wide py-12 border-t border-border">
-    <h2 class="text-2xl font-semibold tracking-tight text-ink mb-6">Pipeline</h2>
-    <div class="rounded-lg border border-border bg-surface/40 p-6 overflow-x-auto">
-      <pre class="text-sm text-muted leading-7 font-mono"><code>{`CloudWatch alarm  ─►  SNS  ─►  /webhooks/cloudwatch-alarm
-                                       │
-                                       ▼
-                              ┌────────────────┐
-                              │  Dedup gate    │  string-match · SQL · RAG (live store lookup)
-                              └────────┬───────┘
-                                       │   (new event)
-                                       ▼
-                              ┌────────────────┐
-                              │  TriageAgent   │  real / noise / duplicate · P0–P3
-                              └────────┬───────┘
-                                       │   (real, ≥ P2)
-                                       ▼
-                              ┌────────────────┐
-                              │ DiagnosisAgent │  grounds every symbol against the live repo
-                              └────────┬───────┘
-                                       ▼
-                              ┌────────────────┐
-                              │FixGeneration   │  writes patch · sandbox test · retry 3×
-                              └────────┬───────┘
-                                       ▼
-                              ┌────────────────┐
-                              │ CodeReview     │  self-critique → open PR
-                              └────────┬───────┘
-                                       ▼
-                              ┌────────────────┐
-                              │ Approval gate  │  HIGH/CRITICAL → human · merge → MonitorGen
-                              └────────────────┘`}</code></pre>
-    </div>
+    <h2 class="text-2xl font-semibold tracking-tight text-ink mb-2">Pipeline</h2>
+    <p class="text-muted mb-2">Every production error flows through this graph. Sandbox failure regenerates the fix up to 3× before any GitHub noise. HIGH/CRITICAL incidents stop at the approval gate.</p>
+    <Mermaid
+      chart={pipelineChart}
+      caption="End-to-end pipeline — from CloudWatch alarm to merged fix PR."
+    />
+  </section>
+
+  <section class="container-wide py-12 border-t border-border">
+    <h2 class="text-2xl font-semibold tracking-tight text-ink mb-2">Deployment topology</h2>
+    <p class="text-muted mb-2">Cloudflare-fronted ALB sits in front of ECS Fargate. Postgres + pgvector is the source of truth for incidents and the RAG index. CI/CD is OIDC — no secrets in the repo.</p>
+    <Mermaid
+      chart={deploymentChart}
+      caption="AWS ECS Fargate · Cloudflare · GitHub Actions OIDC."
+    />
   </section>
 
   <section class="container-wide py-12 border-t border-border">
