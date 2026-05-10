@@ -7,15 +7,48 @@ interface Props {
   title?: string;
   description?: string;
   ogImage?: string;
+  jsonLd?: Record<string, unknown> | Record<string, unknown>[];
 }
 
 const {
   title = "Remediate Labs — autonomous incident remediation for production systems",
   description = "An agent platform that detects production errors, diagnoses root causes, and opens fix PRs in single-digit minutes. Engineering blog and architecture deep-dives.",
   ogImage = "/og-image.png",
+  jsonLd,
 } = Astro.props;
 
 const canonical = new URL(Astro.url.pathname, Astro.site).toString();
+
+const baseJsonLd = [
+  {
+    "@context": "https://schema.org",
+    "@type": "WebSite",
+    name: "Remediate Labs",
+    url: "https://remediatelabs.io",
+    description,
+    publisher: {
+      "@type": "Person",
+      name: "Siddharth Sukumar",
+      url: "https://remediatelabs.io/about",
+    },
+  },
+  {
+    "@context": "https://schema.org",
+    "@type": "Person",
+    name: "Siddharth Sukumar",
+    url: "https://remediatelabs.io/about",
+    sameAs: [
+      "https://github.com/sidreddy88",
+      "https://remediatelabs.io",
+    ],
+    jobTitle: "AI Engineer",
+    description: "Builds production-grade agent systems. Currently working on Remediate Labs.",
+  },
+];
+
+const allJsonLd = jsonLd
+  ? [...baseJsonLd, ...(Array.isArray(jsonLd) ? jsonLd : [jsonLd])]
+  : baseJsonLd;
 ---
 
 <!doctype html>
@@ -47,6 +80,10 @@ const canonical = new URL(Astro.url.pathname, Astro.site).toString();
       href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
       rel="stylesheet"
     />
+
+    {allJsonLd.map((data) => (
+      <script type="application/ld+json" set:html={JSON.stringify(data)} />
+    ))}
   </head>
   <body>
     <Nav />
