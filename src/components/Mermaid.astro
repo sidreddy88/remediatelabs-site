@@ -1,0 +1,62 @@
+---
+interface Props {
+  chart: string;
+  caption?: string;
+}
+const { chart, caption } = Astro.props;
+---
+
+<figure class="not-prose my-10">
+  <div class="rounded-lg border border-border bg-surface/40 p-6 overflow-x-auto">
+    <div class="mermaid text-sm flex justify-center">{chart}</div>
+  </div>
+  {caption && <figcaption class="text-xs text-muted text-center mt-3 italic">{caption}</figcaption>}
+</figure>
+
+<script>
+  import mermaid from "mermaid";
+
+  mermaid.initialize({
+    startOnLoad: false,
+    theme: "base",
+    securityLevel: "loose",
+    fontFamily: "'JetBrains Mono', ui-monospace, Menlo, monospace",
+    themeVariables: {
+      background: "#13161a",
+      primaryColor: "#0b0d10",
+      primaryTextColor: "#e6e8eb",
+      primaryBorderColor: "#2f343b",
+      secondaryColor: "#13161a",
+      secondaryTextColor: "#e6e8eb",
+      secondaryBorderColor: "#2f343b",
+      tertiaryColor: "#0b0d10",
+      tertiaryTextColor: "#9aa1a9",
+      tertiaryBorderColor: "#23272d",
+      lineColor: "#6ee7b7",
+      textColor: "#e6e8eb",
+      mainBkg: "#13161a",
+      nodeBorder: "#2f343b",
+      clusterBkg: "#0b0d10",
+      clusterBorder: "#23272d",
+      titleColor: "#e6e8eb",
+      edgeLabelBackground: "#13161a",
+      labelBoxBkgColor: "#13161a",
+      labelBoxBorderColor: "#2f343b",
+      labelTextColor: "#e6e8eb",
+    },
+    flowchart: {
+      curve: "basis",
+      htmlLabels: true,
+      padding: 16,
+    },
+  });
+
+  // Run on initial page load + on Astro view transitions
+  const render = () => mermaid.run({ querySelector: ".mermaid" });
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", render);
+  } else {
+    render();
+  }
+  document.addEventListener("astro:page-load", render);
+</script>

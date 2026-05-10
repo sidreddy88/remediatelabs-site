@@ -7,6 +7,8 @@ readTime: 8
 seeAlso: ["live-store-vs-chromadb"]
 ---
 
+import Mermaid from "../../components/Mermaid.astro";
+
 I built a deduplication pipeline to prevent my incident remediation system from processing the same error twice. Three layers of checks. The design looked solid on paper.
 
 The same `TypeError: Cannot read properties of undefined (reading 'publish_decision')` created a brand new incident, ran full triage, diagnosis, and fix generation — complete API cost, complete pipeline — despite an existing open incident already having a PR open for the exact same error.
@@ -169,12 +171,29 @@ This is what makes compound failures hard to debug. You can read the code for an
 
 ## The Final Dedup Pipeline
 
-```
-Layer 1  →  string match (whitespace-collapsed)  →  hard block, no API cost
-Layer 2  →  SQL resolved lookup                  →  soft: regression context for triage
-Layer 3  →  RAG semantic (score ≥ 0.90)          →  hard block if open PR exists (live lookup)
-Layer 3b →  RAG semantic context                 →  soft hint to TriageAgent (only when L2 empty)
-```
+<Mermaid
+  chart={`flowchart TB
+    Event([Incoming error event]) --> L1{Layer 1<br/>string match<br/>whitespace-collapsed}
+    L1 -- match --> Drop1([drop · zero API cost])
+    L1 -- miss --> L2[Layer 2<br/>SQL resolved lookup]
+    L2 -- regression found --> Ctx1[Soft: regression context<br/>for TriageAgent]
+    L2 -- nothing --> L3
+    Ctx1 --> L3
+    L3{Layer 3<br/>RAG semantic ≥ 0.90<br/>unconditional}
+    L3 -- candidates --> Live[(Live store<br/>lookup)]
+    Live -- open + has PR --> Drop2([drop · 1 embedding call])
+    Live -- terminal/no PR --> L3b
+    L3 -- no candidates --> L3b
+    L3b[Layer 3b<br/>RAG context<br/>soft hint]
+    L3b --> Triage([TriageAgent])
+    classDef event fill:#0b0d10,stroke:#2f343b,color:#e6e8eb
+    classDef hard fill:#0b0d10,stroke:#6ee7b7,color:#e6e8eb
+    classDef soft fill:#13161a,stroke:#23272d,color:#9aa1a9
+    class Event,Drop1,Drop2,Triage event
+    class L1,L3 hard
+    class L2,L3b,Ctx1,Live soft`}
+  caption="The dedup pipeline after all four fixes. Layer 1 catches the common case with zero API cost. Layer 3 runs unconditionally and reads the live store — it cannot be fooled by stale ChromaDB metadata."
+/>
 
 Layer 1 catches the common case with zero API cost. Layer 3 is the fallback for formatting differences that slip past Layer 1. Layer 3 cannot be fooled by stale metadata because it always reads live status.
 
