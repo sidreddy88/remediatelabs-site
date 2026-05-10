@@ -1,0 +1,30 @@
+---
+interface Metric {
+  label: string;
+  value: string;
+  detail?: string;
+}
+
+const metrics: Metric[] = [
+  { label: "Time-to-first-PR", value: "~6 min", detail: "from CloudWatch alarm" },
+  { label: "Triage accuracy", value: "92%", detail: "100-case golden eval" },
+  { label: "False-positive rate", value: "< 8%", detail: "noise filtered before triage" },
+  { label: "Sample size", value: "100+", detail: "production incidents" },
+];
+---
+
+<section class="container-wide py-12 border-y border-border">
+  <div class="grid grid-cols-2 lg:grid-cols-4 gap-8">
+    {metrics.map((m) => (
+      <div>
+        <p class="text-xs uppercase tracking-wider text-muted">{m.label}</p>
+        <p class="text-3xl sm:text-4xl font-semibold text-ink mt-2 tracking-tight">{m.value}</p>
+        {m.detail && <p class="text-xs text-muted mt-1">{m.detail}</p>}
+      </div>
+    ))}
+  </div>
+  <p class="text-xs text-muted mt-6">
+    Numbers refresh from <code class="text-accent">scripts/measure_mttr.py</code> against the live demo DB.
+    See <a href="/projects/agent-platform#metrics">the methodology</a> for how each is computed.
+  </p>
+</section>

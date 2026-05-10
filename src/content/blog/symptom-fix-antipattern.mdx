@@ -1,0 +1,197 @@
+---
+title: "Why My AI Agent Kept Adding Null Checks Instead of Fixing the Bug"
+tagline: "Five PRs to teach a fix-generation pipeline that the crash site is almost never the fix site. The producer/consumer distinction, RAG's structural blind spot, and what it took to find the actual bug."
+date: 2026-05-02
+tags: ["debugging", "agents", "rag"]
+readTime: 8
+---
+
+I built a closed-loop incident remediation system. When a production error hits my ECS clusters, an agent detects it, diagnoses the root cause, generates a fix, opens a PR, and routes it for review. The goal: mean time to resolution under 5 minutes, no human debugging required.
+
+For one class of errors — TypeErrors from undefined properties — the system was systematically wrong. Not occasionally wrong. Every single time.
+
+The agent kept adding null guards.
+
+```javascript
+// What the agent kept producing
+if (!classifyResult) return;
+const decision = classifyResult?.classification?.publish_decision;
+
+// What the actual fix was
+// (in a completely different file)
+return {
+  ok: false,
+  error: 'Classification error',
+  classification: { publish_decision: 'block' }  // this line was missing
+};
+```
+
+It took five PRs to understand why. Here's what I found.
+
+---
+
+## The Error
+
+```
+TypeError: Cannot read property 'classification' of undefined
+  at checkPrankForInterview (prankCheckerMain.js:296)
+  at runPrankChecker (prankCheckerMain.js:180)
+  at processInterview (interview-user-service.js:445)
+```
+
+The crash was in `checkPrankForInterview()`. It accessed `classifyResult.classification` and `classifyResult` was undefined. The fix seems obvious: check if `classifyResult` exists before accessing it.
+
+That's what the agent did. That's the wrong fix.
+
+The real problem was in `classifyFields()` — an OpenAI API wrapper in a completely different file. When the API failed, it returned `null` instead of a safe object with a default classification. The null guard at the crash site didn't fix that. It just hid it.
+
+The same error would recur on the next OpenAI failure. Which it did.
+
+---
+
+## Failure Point 1: The Stack Trace Only Gave Me Frame Zero
+
+The fix generation agent starts by parsing the stack trace to find which file to fix. My original implementation returned only `frame[0]` — the line that threw.
+
+For null/undefined errors, frame[0] is always the **consumer** — the place that tried to access a property on an undefined value. It is never the **producer** — the place that returned undefined in the first place.
+
+The agent was handed `prankCheckerMain.js:296` and told to fix it. From that location, adding a null check is the minimal correct change. The agent wasn't wrong given what it could see. It just couldn't see enough.
+
+**Fix:** Changed `_parse_stack_trace` to return all frames instead of just the first. Added `_is_null_access_error()` detection. For null/undefined errors, `_resolve_target` now skips frame[0] and tries caller frames first — looking for the producer, not the consumer.
+
+Also added a critique-gated retry: if the self-critique pass flags a fix as `LIKELY WRONG`, the agent switches to the next frame and regenerates with the rejection as context.
+
+---
+
+## Failure Point 2: Diagnosis Was Prescribing the Wrong Fix
+
+Frame routing was now correct. The fix agent was looking at the right file.
+
+It still added a null guard.
+
+The reason: it was following the diagnosis. `DiagnosisAgent` was producing:
+
+```
+fix_approach: "add null check for classifyResult before accessing .classification"
+```
+
+Fix generation agents follow diagnosis. That's the point — diagnosis identifies the problem, fix generation implements the solution. If diagnosis tells fix gen to add a null check, fix gen adds a null check. Correctly and efficiently.
+
+The diagnosis was wrong. Fixing fix generation alone was insufficient because the two agents are coupled. You cannot fix a pipeline by fixing one stage when the problem originates upstream.
+
+**Fix:** Added explicit BAD/GOOD examples to the diagnosis prompt. Banned null-guard language in `fix_approach` for TypeError/undefined errors. Added the pattern to the knowledge base so the same mistake wouldn't recur on future incidents.
+
+---
+
+## Failure Point 3: Right File, Wrong Fix
+
+Frame routing was now correctly moving from `prankCheckerMain.js` to `interview-user-service.js` — one level up the call chain. Diagnosis was no longer prescribing null guards.
+
+The fix agent added a null guard in `interview-user-service.js`.
+
+One level up. Same pattern. Still a symptom fix.
+
+The problem wasn't which file to target. It was what fix to apply once there. The agent was in the right neighborhood but still patching defensively instead of finding the source.
+
+**Fix:** Added `_trace_undefined_source()` — a fast LLM pass that asks a single question: "which function call in this file returns the object whose property is undefined?" It finds that function's definition file via code search and retargets the fix there.
+
+This identified `classifyFields()` in `prankCheckerOpenAI.js` as the actual producer. The function that returned null when OpenAI failed.
+
+---
+
+## Failure Point 4: Diagnosis Found the Right File But Nobody Saved It
+
+This one was an infrastructure bug, not an agent reasoning bug.
+
+`DiagnosisAgent` had actually been producing correct output — `affected_file: prankCheckerMain.js`, `affected_function: runPrankChecker`. It knew where the problem was.
+
+But after diagnosis completed, those fields were never written to `IncidentState`. Fix generation never saw them. It fell back to parsing the stack trace and the entire cycle repeated.
+
+The agents were reasoning correctly. The state handoff between them was broken.
+
+**Fix:** Added `diagnosis_affected_file` and `diagnosis_affected_function` to `IncidentState`. Saved both fields after diagnosis in the incident loop. Added Step 0 in `_resolve_target`: for null errors, check the diagnosis-identified producer first, verify the function is actually defined there (not just called or imported), then fall back to the stack trace.
+
+---
+
+## Failure Point 5: RAG Returned Fragments, Not Files
+
+With the right file identified and the state handoff fixed, `DiagnosisAgent` was pointing at `runPrankChecker` in `prankCheckerMain.js`. This was correct.
+
+The fix agent audited the function and concluded it was fine.
+
+It was reading a partial view.
+
+My RAG system chunks files into 50-line segments with 10-line overlap. A semantic search returns the most relevant chunks — typically one or two per file. `prankCheckerMain.js` is ~200 lines. `runPrankChecker` spans about 60 lines across the file.
+
+The function has three return paths:
+
+- Happy path: `return { ok: true, classification: result }`
+- Error path 1: `return { ok: false, error: 'Classification service unavailable' }`
+- Error path 2: `return { ok: false, error: 'Classification error: ...' }`
+
+RAG returned the chunk containing the function signature and the happy path. The error return paths at lines 40–55 were in a different chunk. The agent saw `classification` present in the happy path and concluded the function was correct.
+
+**The agent wasn't wrong. It was reasoning correctly from incomplete data.**
+
+This is a fundamental RAG limitation for code analysis. RAG finds semantic similarity — it's excellent for finding files about similar topics, similar error patterns, similar domains. It is not designed to return every return statement in a function. Those return statements aren't semantically similar to each other. They're structurally related. RAG doesn't know about structure.
+
+**Fix:** Added `get_file_contents(file_path)` tool to `DiagnosisAgent` — fetches the complete raw source from GitHub, capped at 8000 characters. Updated the diagnosis prompt:
+
+> "RAG returns 400-char fragments — you MUST read the full file to see every return statement. Call get_file_contents after search_codebase identifies a candidate file."
+
+With the full file visible, the agent could see all three return paths in one pass. The two error paths omitted `classification`. The caller always accessed `.classification`. That's the bug.
+
+---
+
+## The Actual Fix
+
+```javascript
+// prankCheckerOpenAI.js — classifyFields()
+// Before: returned null on OpenAI failure
+if (error) return null;
+
+// After: returns safe default that callers can always destructure
+if (error) return {
+  ok: false,
+  error: error.message,
+  classification: { publish_decision: 'block' }
+};
+```
+
+One function. One return path. No null guards anywhere in the call chain.
+
+---
+
+## Why It Required Five PRs
+
+Each fix was necessary but not sufficient:
+
+| PR | What changed | Why it wasn't enough alone |
+|----|-------------|---------------------------|
+| #56 | Stack trace returns all frames, skip frame[0] for null errors | Fix gen still followed bad diagnosis |
+| #57 | `_trace_undefined_source()` finds the actual producer | Diagnosis still prescribed null guards |
+| #58 | Diagnosis prompt bans null-guard fix approaches | Right file but state handoff broken |
+| #63 | Diagnosis output saved to IncidentState | Agent had incomplete file view via RAG |
+| #64/65 | Full file fetch via `get_file_contents` | All five layers now working together |
+
+The system failed because multiple components were independently wrong in ways that compounded. Fixing any one of them in isolation left the others producing the same output through a different path.
+
+---
+
+## What I'd Do Differently
+
+**Start with the producer, not the consumer.** For any error involving undefined or null, the crash site is almost never the fix site. The first question should be "what returned this value?" not "what crashed on this value?"
+
+**Agents in a pipeline are coupled.** Diagnosis and fix generation are not independent. If diagnosis is wrong, fix generation will be wrong regardless of how good its routing logic is. Debug the pipeline as a system, not as individual components.
+
+**RAG is for similarity, not structure.** RAG is excellent at finding semantically related content — similar errors, similar domains, similar patterns. It is not a substitute for reading a file. When you need to audit every return path in a function, fetch the file. Don't search for it.
+
+**Null guards are a signal, not a fix.** When an agent (or a developer) reaches for a null check, ask why the value is null. The null check is sometimes correct — but it should be a deliberate choice, not the default response to a TypeError.
+
+---
+
+The system now correctly identifies the producer for this class of errors and fixes the return path instead of the consumer. MTTR on null/undefined TypeErrors went from "wrong fix, recurs in two weeks" to "correct fix, issue closed."
+
+Five PRs to get there. Each one taught me something the previous fix exposed.
+
+That's the job.

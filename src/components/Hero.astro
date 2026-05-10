@@ -1,0 +1,29 @@
+---
+import DemoCTA from "./DemoCTA.astro";
+---
+
+<section class="container-wide pt-20 pb-16 sm:pt-28 sm:pb-24">
+  <div class="max-w-3xl">
+    <span class="pill mb-6">Production-grade agent platform</span>
+    <h1 class="text-4xl sm:text-5xl lg:text-6xl font-semibold tracking-tight text-ink leading-[1.05]">
+      Autonomous incident remediation,<br />
+      <span class="text-accent">in single-digit minutes.</span>
+    </h1>
+    <p class="text-lg sm:text-xl text-muted mt-8 leading-relaxed">
+      Remediate Labs is a multi-agent system that detects production errors from CloudWatch,
+      diagnoses the root cause from your codebase, generates a fix, and opens a PR — all
+      before anyone gets paged. Built with the Anthropic SDK on FastAPI + Postgres + pgvector.
+    </p>
+    <div class="flex flex-col sm:flex-row gap-3 mt-10">
+      <DemoCTA />
+      <a
+        href="https://github.com/sidreddy88/agent-platform"
+        target="_blank"
+        rel="noopener"
+        class="inline-flex items-center justify-center rounded-md border border-border bg-surface px-5 py-3 text-sm font-medium text-ink hover:border-accent transition-colors no-underline"
+      >
+        See the code on GitHub →
+      </a>
+    </div>
+  </div>
+</section>

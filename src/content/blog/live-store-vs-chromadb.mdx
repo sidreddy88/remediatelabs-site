@@ -1,0 +1,167 @@
+---
+title: "RAG Finds the Candidate. The Live Store Confirms the Truth."
+tagline: "A search index can't be a source of truth — that's a category error, not just a bug. The general rule for any vector or search index sitting in front of a live data store."
+date: 2026-05-02
+tags: ["architecture", "rag", "agents"]
+readTime: 7
+seeAlso: ["rag-dedup-failure"]
+---
+
+When I added semantic deduplication to my incident pipeline, I made a mistake that took a production failure to expose: I trusted ChromaDB to tell me the current state of an incident.
+
+It couldn't. It never could. That's not what it's for.
+
+Here's what I learned about the difference between a search index and a source of truth — and why confusing them is a category error, not just a bug.
+
+---
+
+## The Setup
+
+My incident pipeline runs when a production error is detected. Before doing any expensive work — triage, diagnosis, fix generation — it checks whether the same error is already being handled. If there's an open incident with an open PR, drop the duplicate and move on.
+
+The deduplication check used RAG to find semantically similar past incidents:
+
+```python
+similar = await self._rag.search_incidents(query, min_score=0.90)
+for s in similar:
+    if s["status"] not in terminal_states and s["pr_url"]:
+        return  # drop the duplicate
+```
+
+`s["status"]` came from ChromaDB metadata. That metadata was stored when the incident was indexed. The bug: I was using a snapshot taken at creation time to make a blocking decision at t=4.
+
+---
+
+## What ChromaDB Actually Is
+
+ChromaDB is a vector database. You give it text, it converts that text into an embedding vector and stores it. Later, you give it a query, it finds the stored vectors most similar to that query and returns them.
+
+It is optimized for one thing: finding things that are semantically similar to other things. It is extraordinarily good at this.
+
+It is not a live database. It doesn't watch your incidents and update itself when they change state. It stores exactly what you gave it at index time, and that's what it returns forever — until you explicitly update it.
+
+My code indexed incidents like this:
+
+```python
+metadatas=[{
+    "incident_id": incident.id,
+    "status": incident.status.value,   # snapshot at index time
+    "pr_url": incident.pr_url or "",   # snapshot at index time
+}]
+```
+
+And only called `index_incident()` in two places: when an incident was created, and when it resolved.
+
+So for the entire active lifetime of an incident — `TRIAGING` → `FIXING` → `REVIEWING` → `AWAITING_APPROVAL` → `AWAITING_REFIX_APPROVAL` — ChromaDB held a frozen snapshot from the moment the incident was born. Five state transitions invisible to it.
+
+---
+
+## What the Live Store Actually Is
+
+The live store is `incident_store` — an in-memory object backed by SQLite that holds the current state of every incident. Every state transition writes to it immediately:
+
+```python
+incident_store.update(incident_id, status=IncidentStatus.REVIEWING)
+incident_store.update(incident_id, pr_url="https://github.com/...")
+```
+
+At any point in time, `incident_store.get(incident_id)` returns the real current state — not a snapshot, not a cache, the actual truth right now.
+
+When the duplicate error arrived and the incident was at `AWAITING_REFIX_APPROVAL`, the live store knew that immediately. ChromaDB still had `TRIAGING` from four state transitions ago.
+
+---
+
+## The Failure
+
+The same `TypeError: Cannot read properties of undefined (reading 'publish_decision')` arrived again. An open incident already existed with an open PR. The pipeline should have dropped it.
+
+Instead it ran the full pipeline — triage, diagnosis, fix generation, a second PR for a bug that already had a PR open.
+
+Tracing through why:
+
+```
+Layer 1 (string match)     → missed due to whitespace difference in log format
+Layer 2 (SQL lookup)       → found a resolved incident, set regression context
+Layer 3 (RAG)              → gated behind Layer 2, never ran
+```
+
+Even if Layer 3 had run, it would have read `s["status"]` from ChromaDB — which showed `TRIAGING`, not `AWAITING_REFIX_APPROVAL`. The blocking check would have correctly identified this as a non-terminal state and dropped the event. But only accidentally — the status it read was wrong, it just happened to be wrong in the right direction.
+
+That's a broken clock being right twice a day. The next incident might be in a state where the stale status was terminal-looking, and a real duplicate would slip through.
+
+---
+
+## The Fix
+
+Two lines changed:
+
+```python
+# Before — trusting ChromaDB metadata
+if s["status"] not in terminal_states and s["pr_url"]:
+    return
+
+# After — using ChromaDB only to find the candidate
+live = incident_store.get(s["incident_id"])
+if live and live.status not in terminal_states and live.pr_url:
+    return
+```
+
+ChromaDB still does the search. It's excellent at finding semantically similar incidents — that part works perfectly. But the moment we have a candidate incident ID, we immediately go to the live store to find out what that incident actually looks like right now.
+
+RAG finds the candidate. The live store confirms the truth.
+
+---
+
+## Why This Is a Category Error, Not Just a Bug
+
+The instinct to use ChromaDB metadata for status checks is understandable. The metadata is right there in the search result. Fetching from the live store is an extra call. It feels redundant.
+
+But ChromaDB and the live store are doing completely different jobs:
+
+| | ChromaDB | Live store |
+|---|---|---|
+| Purpose | Find semantically similar things | Track current state of things |
+| Updated | When you explicitly call index | On every state transition |
+| Query type | "What's similar to this?" | "What is this right now?" |
+| Consistency | Eventual (when you index) | Immediate |
+| Right tool for | Finding candidates | Confirming current truth |
+
+Using ChromaDB to answer "what is the current status of this incident?" is like checking last year's org chart to find out who's managing a team today. The chart was accurate when it was printed. It might still be accurate. But it has no mechanism to stay current, so you can't trust it for time-sensitive decisions.
+
+The org chart is useful for finding names. HR's live database is the source of truth for current roles. Those are different tools for different questions.
+
+---
+
+## The General Rule
+
+Any time you have a search index sitting in front of a live data store, the same principle applies:
+
+**Use the index to find candidates. Use the live store to confirm their current state.**
+
+This is true for ChromaDB. It's also true for Elasticsearch, Pinecone, Weaviate, or any other vector or search index you put in front of a database. Indexes are optimized for retrieval, not for reflecting real-time state. The moment you use index metadata to make a decision that depends on current state, you've introduced a staleness bug that will surface under exactly the wrong conditions — when an incident is active, when state is changing, when you most need the answer to be right.
+
+The extra round-trip to the live store is not overhead. It's correctness.
+
+---
+
+## What Changed
+
+```python
+# Layer 3: RAG hard-block — unconditional, live store lookup
+_rag_similar = await self._rag.search_incidents(query, min_score=0.90)
+_terminal = {RESOLVED, REJECTED, NOISE, DUPLICATE}
+for s in _rag_similar:
+    live = incident_store.get(s["incident_id"])
+    if live and live.status not in _terminal and live.pr_url:
+        return  # drop event — real open incident exists
+```
+
+Three things in this version that weren't in the original:
+
+1. **Unconditional** — runs regardless of what Layer 2 found, so it can't be silenced by a regression detection
+2. **Live store lookup** — `incident_store.get()` not `s["status"]`, so the status is always current
+3. **Higher threshold (0.90 vs 0.80)** — hard blocks should only fire on near-identical matches; soft context can be looser
+
+The dedup pipeline now drops duplicates correctly even when the existing incident is deep in its lifecycle. The full pipeline cost for a caught duplicate: one embedding call and one in-memory lookup. Before the fix: full triage, diagnosis, fix generation, and a redundant PR.
+
+The fix wasn't clever. It was just using each tool for what it's designed for.

@@ -1,0 +1,118 @@
+---
+title: "The Fix That Broke My Agent in a Different Way"
+tagline: "MANDATORY CONSTRAINTS stopped the hallucination. Then the agent looped on the same tool 10 times. Three words on the constraint fixed it. Why precision in prompts is everything."
+date: 2026-04-20
+tags: ["debugging", "agents", "prompting"]
+readTime: 4
+seeAlso: ["debugging-hallucinating-agents"]
+---
+
+*This is part of a series on building a PR automation system. The [previous post](/blog/debugging-hallucinating-agents) covered how my CICDAgent hallucinated a detailed CI failure report without calling a single tool — and how adding MANDATORY CONSTRAINTS to the prompt fixed it.*
+
+The MANDATORY CONSTRAINTS worked. The agent stopped hallucinating. I merged the PR and moved on.
+
+Then I checked the next trace.
+
+---
+
+## What happened this time
+
+```
+CICDAgent (agent)
+├── get_workflow_runs (tool)
+├── get_workflow_runs (tool)
+├── get_workflow_runs (tool)
+├── get_workflow_runs (tool)
+├── get_workflow_runs (tool)
+├── get_workflow_runs (tool)
+├── get_workflow_runs (tool)
+├── get_workflow_runs (tool)
+├── get_workflow_runs (tool)
+└── get_workflow_runs (tool)
+```
+
+11 spans. 10 identical tool calls, same input, same output, every single iteration. The agent never called `get_run_logs`. Never called `analyze_failure`. Just `get_workflow_runs`, over and over, until it hit the 10-iteration limit and gave up with: *"I was unable to find an answer within the allowed number of steps."*
+
+| Signal | Value | Verdict |
+|---|---|---|
+| Span count | 11 (1 agent + 10 tool) | Active but stuck |
+| Unique tools called | 1 of 4 needed | Looping |
+| Iterations | 10/10 | Hit the limit |
+| Output | "unable to find answer" | Failed |
+
+The hallucination was gone. A new failure had taken its place.
+
+---
+
+## The root cause was in my own prompt
+
+The constraint I'd added in the previous fix:
+
+```python
+"MANDATORY CONSTRAINTS:\n"
+"- You MUST call get_workflow_runs before any other tool or your Answer.\n"  # ← this line
+"- You MUST call get_run_logs and analyze_failure before writing your Answer.\n"
+```
+
+That first constraint has two valid interpretations:
+
+| Intended meaning | What the LLM read |
+|---|---|
+| Call it once, at the start, before anything else | Call it before every other tool — always call it first at each step |
+
+The LLM followed the second interpretation. Each iteration played out like this:
+
+```
+Iteration 1:  call get_workflow_runs  ✓ (satisfies "before any other tool")
+Iteration 2:  about to call get_run_logs...
+              but constraint says: call get_workflow_runs before any other tool
+              → call get_workflow_runs again
+Iteration 3:  same logic → get_workflow_runs again
+...
+Iteration 10: same → MAX_ITERATIONS → give up
+```
+
+The tool returned the same result every time. The LLM was stuck in a rule it couldn't escape, and never progressed past the first tool call.
+
+---
+
+## The fix: three words
+
+```python
+"MANDATORY CONSTRAINTS:\n"
+"- Call get_workflow_runs exactly once as your first tool call, then move on.\n"  # ← changed
+"- You MUST call get_run_logs and analyze_failure before writing your Answer.\n"
+```
+
+Three changes:
+
+1. **"exactly once"** — eliminates the loop. One call, done, never again.
+2. **"as your first tool call"** — scopes the timing to the start, not to every subsequent step.
+3. **"then move on"** — explicitly tells the LLM what to do after. Closes the question of what follows.
+
+After this change, the trace looked right:
+
+```
+CICDAgent (agent)
+├── get_workflow_runs (tool)     ← called once
+├── get_run_logs (tool)          ← moved on
+└── analyze_failure (tool)       ← finished the job
+```
+
+---
+
+## The underlying lesson
+
+Constraints create edges the LLM will follow literally. When you write "before X," the LLM applies it everywhere it sees X — not just at the start of the workflow.
+
+This is the second-order effect of prompt engineering. Every constraint needs to be read from the LLM's perspective, not yours. What sounds unambiguous to you — *"call this tool before any other"* — may have a perfectly logical alternative interpretation that causes the agent to loop forever.
+
+When writing constraints, specify three things:
+
+1. **How many times** — "once", "exactly once", "at most once"
+2. **When** — "as your first action", not "before every..."
+3. **What to do next** — "then move on" removes the question of what follows
+
+The hallucination fix taught me that suggestions get ignored — you need MUST. The loop fix taught me that MUST isn't enough — you need precision. One ambiguous word in a constraint and the agent follows the wrong interpretation faithfully, all the way to the iteration limit.
+
+The agent did exactly what the prompt said. The prompt just didn't say what I meant.

@@ -1,0 +1,82 @@
+---
+import BaseLayout from "./BaseLayout.astro";
+import { getCollection } from "astro:content";
+
+interface Props {
+  title: string;
+  tagline: string;
+  date: Date;
+  tags: string[];
+  readTime: number;
+  seeAlso?: string[];
+}
+
+const { title, tagline, date, tags, readTime, seeAlso = [] } = Astro.props;
+
+const dateStr = date.toLocaleDateString("en-US", {
+  year: "numeric",
+  month: "long",
+  day: "numeric",
+});
+
+let related: { slug: string; data: { title: string; tagline: string } }[] = [];
+if (seeAlso.length) {
+  const all = await getCollection("blog");
+  related = seeAlso
+    .map((s) => all.find((p) => p.slug === s))
+    .filter((p): p is NonNullable<typeof p> => p !== undefined)
+    .map((p) => ({ slug: p.slug, data: p.data }));
+}
+---
+
+<BaseLayout title={`${title} — Remediate Labs`} description={tagline}>
+  <article class="container-prose pt-16 pb-12">
+    <header class="mb-10 not-prose">
+      <div class="flex items-center gap-3 text-xs text-muted mb-4">
+        <time datetime={date.toISOString()}>{dateStr}</time>
+        <span>·</span>
+        <span>{readTime} min read</span>
+      </div>
+      <h1 class="text-3xl sm:text-4xl font-semibold tracking-tight text-ink leading-tight">
+        {title}
+      </h1>
+      <p class="text-muted text-lg mt-4 leading-relaxed">{tagline}</p>
+      <div class="flex flex-wrap gap-2 mt-6">
+        {tags.map((tag) => (
+          <a href={`/blog/tag/${tag}`} class="pill no-underline hover:border-accent hover:text-accent">
+            {tag}
+          </a>
+        ))}
+      </div>
+    </header>
+
+    <div class="prose prose-invert max-w-none prose-pre:bg-[#0d1117] prose-headings:scroll-mt-20 prose-h2:text-2xl prose-h2:mt-12 prose-h2:mb-4 prose-h3:mt-8 prose-h3:mb-3 prose-p:leading-relaxed">
+      <slot />
+    </div>
+
+    {related.length > 0 && (
+      <section class="mt-20 pt-10 border-t border-border not-prose">
+        <h2 class="text-xs uppercase tracking-wider text-muted mb-5">See also</h2>
+        <ul class="space-y-4">
+          {related.map((r) => (
+            <li>
+              <a href={`/blog/${r.slug}`} class="block group no-underline">
+                <p class="text-ink font-medium group-hover:text-accent transition-colors">
+                  {r.data.title}
+                </p>
+                <p class="text-sm text-muted mt-1">{r.data.tagline}</p>
+              </a>
+            </li>
+          ))}
+        </ul>
+      </section>
+    )}
+
+    <div class="mt-16 pt-8 border-t border-border not-prose text-sm text-muted flex justify-between">
+      <a href="/blog" class="hover:text-ink">← All posts</a>
+      <a href="https://github.com/sidreddy88/agent-platform" target="_blank" rel="noopener" class="hover:text-ink">
+        See the code →
+      </a>
+    </div>
+  </article>
+</BaseLayout>

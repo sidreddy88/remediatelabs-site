@@ -1,0 +1,195 @@
+---
+title: "Why the Same Bug Kept Creating New Incidents (And What That Taught Me About RAG)"
+tagline: "Three layers of dedup. Four independent failure modes that all had to fire simultaneously. The compound bug that exposed them, and the principle that makes it not happen again."
+date: 2026-05-02
+tags: ["debugging", "rag", "agents"]
+readTime: 8
+seeAlso: ["live-store-vs-chromadb"]
+---
+
+I built a deduplication pipeline to prevent my incident remediation system from processing the same error twice. Three layers of checks. The design looked solid on paper.
+
+The same `TypeError: Cannot read properties of undefined (reading 'publish_decision')` created a brand new incident, ran full triage, diagnosis, and fix generation — complete API cost, complete pipeline — despite an existing open incident already having a PR open for the exact same error.
+
+All three layers failed simultaneously. Here's why.
+
+---
+
+## The System
+
+When a production error arrives, before any expensive work happens, the pipeline runs three dedup checks:
+
+```
+Layer 1  →  String match against open incidents     — hard block
+Layer 2  →  SQL lookup for resolved incidents       — soft: regression context
+Layer 3  →  RAG semantic search                     — soft: context for TriageAgent
+```
+
+Only Layer 1 was a hard block — it actually dropped the event before an incident was created. Layers 2 and 3 injected context into the triage prompt and let the LLM decide.
+
+This architecture had three independent failure points, all of which had to be true simultaneously for the bug to manifest. They were.
+
+---
+
+## Failure Point 1: Whitespace Broke the String Match
+
+Layer 1 compares the incoming error description to stored incident descriptions using a normalization function:
+
+```python
+return re.sub(r'\b[a-f0-9]{8,}\b|\b\d+[a-zA-Z]*\b', 'X', description[:100]).strip()
+```
+
+This replaces hex strings and numbers with `X` so that errors with different memory addresses or line numbers still match. It does nothing with whitespace.
+
+The same error from CloudWatch arrived with different formatting on the second occurrence:
+
+```
+# Stored incident
+TypeError: Cannot read properties of undefined (reading 'publish_decision')\n/app/constants/prankChec
+
+# New incoming event
+TypeError: Cannot read properties of undefined (reading 'publish_decision') /app/constants/prankChec
+```
+
+One character difference: `\n` vs a space between the error message and the file path. After normalization, two different strings. Layer 1 didn't match. The event passed through.
+
+**Fix:** Collapse all whitespace before token replacement:
+
+```python
+collapsed = re.sub(r'\s+', ' ', description[:300]).strip()
+return re.sub(r'\b[a-f0-9]{8,}\b|\b\d+[a-zA-Z]*\b', 'X', collapsed[:100])
+```
+
+CloudWatch log formatting is not consistent. Normalization that doesn't handle whitespace will miss matches on identical errors that arrived through slightly different log paths.
+
+---
+
+## Failure Point 2: Layer 2 Was Silently Gating Layer 3
+
+Even with Layer 1 missing the match, Layer 3 (RAG) should have caught the duplicate. It didn't run.
+
+The code was:
+
+```python
+# Layer 2
+past = incident_store.get_resolved_for_error(error_type, service)
+if past:
+    prior_context = "REGRESSION: ..."
+
+# Layer 3 — only runs when prior_context is still None
+if prior_context is None and self._rag is not None:
+    similar = await self._rag.search_incidents(query, min_score=0.80)
+    ...
+```
+
+There was a previously resolved incident for the same error type and service. Layer 2 found it, set `prior_context`, and short-circuited Layer 3. RAG never ran.
+
+The intent was reasonable: if Layer 2 already has context, skip the expensive embedding call. The side effect: RAG could never catch open duplicates when a regression was detected simultaneously. The two conditions — "this looks like a regression" and "there's already an open PR for this" — are not mutually exclusive. The architecture treated them as if they were.
+
+**Fix:** RAG runs unconditionally, regardless of what Layer 2 found. The embedding call is cheap compared to running the full pipeline on a duplicate incident.
+
+---
+
+## Failure Point 3: An LLM Decision Is Not a Hard Block
+
+Even if Layer 3 had run, it wasn't capable of dropping the event.
+
+The RAG layer built a string:
+
+```python
+if similar:
+    lines = ["Semantically similar past incidents:"]
+    for s in similar:
+        lines.append(f"  [{s['score']:.2f}] {s['text'][:200]}\n    PR: {s['pr_url']}")
+    prior_context = "\n".join(lines)
+```
+
+This got injected into the TriageAgent prompt. Whether the event was treated as a duplicate then depended entirely on the LLM deciding to output `"decision": "duplicate"`.
+
+An LLM-based decision is not a reliable dedup gate. It's a suggestion. It can be overridden by prompt wording, model temperature, context window pressure, or subtle differences in how the similar incident is described. A hard block needs to be deterministic. "The LLM will probably say duplicate" is not deterministic.
+
+This is a general principle worth internalizing: **soft and hard are different categories, not points on a spectrum.** Using soft context to achieve hard blocking guarantees reliability somewhere between "usually" and "mostly." Production deduplication requires "always."
+
+**Fix:** Layer 3 becomes a hard block with a live store lookup:
+
+```python
+# Layer 3: RAG hard-block — unconditional
+_rag_similar = await self._rag.search_incidents(query, min_score=0.90)
+_terminal = {RESOLVED, REJECTED, NOISE, DUPLICATE}
+for s in _rag_similar:
+    live = incident_store.get(s["incident_id"])
+    if live and live.status not in _terminal and live.pr_url:
+        return  # drop event
+```
+
+Three design decisions baked into this:
+
+- **Unconditional**: not gated on `prior_context is None`
+- **Live store lookup**: ignores ChromaDB metadata, reads current status directly
+- **Higher threshold (0.90 vs 0.80)**: hard blocks should only fire on near-identical matches
+
+---
+
+## Failure Point 4: ChromaDB Metadata Goes Stale
+
+The live store lookup in the fix above is deliberate. Using `s["status"]` from ChromaDB would have been wrong.
+
+RAG stores metadata at index time:
+
+```python
+metadatas=[{
+    "incident_id": incident.id,
+    "status": incident.status.value,   # snapshot at index time
+    "pr_url": incident.pr_url or "",   # snapshot at index time
+}]
+```
+
+An incident is only re-indexed when it resolves. During its lifetime — `TRIAGING` → `FIXING` → `REVIEWING` → `AWAITING_APPROVAL` → `AWAITING_REFIX_APPROVAL` — the metadata in ChromaDB reflects whatever state it was in when last indexed. For an incident currently `AWAITING_REFIX_APPROVAL`, ChromaDB might have it stored as `TRIAGING` or not indexed at all.
+
+If the blocking logic had used `s["status"]` to determine whether an incident was still open, it would have been making a blocking decision based on a stale snapshot. An incident that was `TRIAGING` two days ago might be resolved now. Or open but in a state ChromaDB has never seen.
+
+**The live store is the only authoritative source of current status.** RAG is for finding candidates. The live store confirms their current state. These are two different jobs and they should never be conflated.
+
+---
+
+## Why All Four Had to Be True
+
+Each failure point alone would have been survivable:
+
+- **If Layer 1 had matched**: the event drops immediately. Nothing else matters.
+- **If Layer 2 hadn't gated Layer 3**: RAG would have run and found the open incident.
+- **If Layer 3 had been a hard block**: even as a soft context pass, if it had drop semantics, the LLM decision wouldn't matter.
+- **If the live store lookup had been in place**: stale metadata couldn't cause a false negative.
+
+The combination of all four meant: Layer 1 missed a formatting difference, Layer 2 fired and silenced Layer 3, Layer 3 was a suggestion not a block, and the metadata it would have read was stale anyway. Four independent failure modes, all active simultaneously.
+
+This is what makes compound failures hard to debug. You can read the code for any single layer and conclude it's reasonable. The failure only becomes visible when you trace one specific event through all three layers and ask why each one didn't catch it.
+
+---
+
+## The Final Dedup Pipeline
+
+```
+Layer 1  →  string match (whitespace-collapsed)  →  hard block, no API cost
+Layer 2  →  SQL resolved lookup                  →  soft: regression context for triage
+Layer 3  →  RAG semantic (score ≥ 0.90)          →  hard block if open PR exists (live lookup)
+Layer 3b →  RAG semantic context                 →  soft hint to TriageAgent (only when L2 empty)
+```
+
+Layer 1 catches the common case with zero API cost. Layer 3 is the fallback for formatting differences that slip past Layer 1. Layer 3 cannot be fooled by stale metadata because it always reads live status.
+
+---
+
+## Three Lessons That Generalize
+
+**Soft and hard are different categories.** Injecting context into an LLM prompt and expecting it to reliably produce a specific output is a soft mechanism. If you need a hard guarantee — event dropped, action blocked, duplicate rejected — implement it deterministically. Don't use "the LLM will probably do the right thing" where you need a circuit breaker.
+
+**RAG metadata goes stale.** ChromaDB stores what you give it at index time. If the underlying record changes after indexing, the metadata is wrong. For any decision that depends on current state — is this incident still open? does this PR still exist? — query the live store. Use RAG to find candidates, not to confirm current truth.
+
+**Layer ordering creates invisible dependencies.** When Layer N gates Layer N+1, you've created a coupling that isn't visible from reading either layer in isolation. The short-circuit made sense as a cost optimization. The side effect — that RAG could never fire when a regression was detected — was invisible until a specific combination of conditions exposed it. Document gating logic explicitly and ask what scenarios it prevents downstream layers from running.
+
+---
+
+The dedup pipeline now processes the same error correctly on re-occurrence. The full pipeline cost for a duplicate incident: one string comparison and one embedding call. Before the fix: full triage, diagnosis, fix generation, and a PR for a bug that already had a PR open.
+
+Two root causes. Four failure points. One event that exposed all of them.

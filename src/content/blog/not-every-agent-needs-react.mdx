@@ -1,0 +1,110 @@
+---
+title: "Not Every Agent Needs a ReAct Loop"
+tagline: "ReAct is one pattern, not the default. Three patterns for what each agent actually needs from the LLM — and when the answer is no LLM at all."
+date: 2026-04-20
+tags: ["architecture", "agents"]
+readTime: 4
+seeAlso: ["four-agent-patterns"]
+---
+
+When I started building a PR automation tool — something that could review code, generate fixes, and open pull requests without a human in the loop — the first thing I reached for was a ReAct agent. It's the default mental model: LLM thinks, calls a tool, thinks again, repeats until done.
+
+It worked. But somewhere in the middle of wiring up the fourth agent in the system, I noticed something. Some of these agents weren't really *reasoning* their way through a problem. They were doing one focused job. Or just calling an API. Wrapping all of that in a ReAct loop felt like using a forklift to move a chair.
+
+So I stepped back and mapped out what each agent actually needed from the LLM. Three distinct patterns showed up.
+
+---
+
+## Pattern 1: ReAct Loop — let the LLM drive
+
+The LLM decides what tools to call, in what order, and when it has enough information to answer.
+
+```
+User question
+  → LLM thinks → calls tool A
+  → LLM thinks → calls tool B
+  → LLM thinks → "I have enough, here's my answer"
+```
+
+This is the right pattern when the steps are genuinely unpredictable. For a `TriageAgent` or `DiagnosisAgent`, you don't know upfront which files are relevant, which logs to pull, or how many hops it'll take to understand what broke. The LLM needs to explore.
+
+**Use ReAct when:** the path to the answer is unknown ahead of time.
+
+---
+
+## Pattern 2: Direct Single LLM Call — one job, one call
+
+You call the LLM exactly once for a specific, well-scoped task. No loop, no tools, no back and forth.
+
+```python
+response = await self._llm.complete(messages=[
+    {"role": "user", "content": f"Fix this broken code:\n\n{content}"}
+])
+```
+
+In `FixGenerationAgent`, the fix generation step is like this. By the time we're asking the LLM to generate a fix, we've already fetched the relevant file. The inputs are known. The task is clear. There's no exploration needed — just one focused reasoning step.
+
+Wrapping this in a ReAct loop would add latency, extra tokens, and complexity for no real benefit.
+
+**Use a direct call when:** the task is well-defined and all the inputs are already in hand.
+
+---
+
+## Pattern 3: No LLM — plain Python or API
+
+Some steps don't need intelligence at all.
+
+```python
+content = await self._github.get_file_contents(...)  # no LLM
+await self._github.create_pull_request(...)           # no LLM
+```
+
+Fetching a file, creating a PR, running a blast radius check — these are mechanical steps. They don't require reasoning. Routing them through an LLM would just add noise.
+
+**Use plain code when:** the step is deterministic and doesn't require understanding anything.
+
+---
+
+## Seeing all three in one agent
+
+`FixGenerationAgent` is a clean example of how the three patterns combine in a single workflow:
+
+```python
+async def fix(self, incident):
+    # Pattern 3: No LLM — just fetch data
+    content = await self._github.get_file_contents(...)
+
+    # Pattern 2: Direct LLM call — one focused reasoning task
+    old_function, new_function = await self._generate_fix(content)
+
+    # Pattern 3: Pure Python logic
+    br_result = BlastRadiusGuard().check(...)
+
+    # Pattern 3: API calls
+    await self._github.create_issue(...)
+    await self._github.create_pull_request(...)
+```
+
+The LLM is only called where actual reasoning is needed. Everything else is just code.
+
+---
+
+## The decision framework
+
+Every step in an agent comes down to one question: *does this step require reasoning?*
+
+| Does it need reasoning? | Pattern | Example |
+|---|---|---|
+| Yes — and steps are unpredictable | ReAct loop | `TriageAgent` |
+| Yes — but it's one focused task | Direct LLM call | `FixGenerationAgent._generate_fix` |
+| No | Plain Python / API | `create_pull_request` |
+
+---
+
+## The mental shift
+
+The ReAct loop is a great pattern. But it's one pattern, not the default.
+
+An LLM is a tool your code calls — sometimes in a loop where it drives the whole process, sometimes once for a specific job, and sometimes not at all. The agent decides based on what each step actually needs, not based on what feels most "agentic."
+
+Once I started thinking this way, the PR automation system got simpler, faster, and a lot easier to debug. Each agent does exactly as much as it needs to, and nothing more.

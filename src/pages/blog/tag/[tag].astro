@@ -1,0 +1,57 @@
+---
+import BaseLayout from "../../../layouts/BaseLayout.astro";
+import BlogCard from "../../../components/BlogCard.astro";
+import { getCollection, type CollectionEntry } from "astro:content";
+
+export async function getStaticPaths() {
+  const posts = await getCollection("blog");
+  const tags = Array.from(new Set(posts.flatMap((p) => p.data.tags)));
+  return tags.map((tag) => ({
+    params: { tag },
+    props: {
+      tag,
+      posts: posts
+        .filter((p) => p.data.tags.includes(tag))
+        .sort((a, b) => b.data.date.valueOf() - a.data.date.valueOf()),
+    },
+  }));
+}
+
+interface Props {
+  tag: string;
+  posts: CollectionEntry<"blog">[];
+}
+
+const { tag, posts } = Astro.props;
+---
+
+<BaseLayout
+  title={`#${tag} — Remediate Labs`}
+  description={`Blog posts tagged ${tag}.`}
+>
+  <section class="container-wide pt-16 pb-8">
+    <a href="/blog" class="text-sm text-muted hover:text-ink">← All posts</a>
+    <h1 class="text-4xl sm:text-5xl font-semibold tracking-tight text-ink mt-4">
+      <span class="text-muted">#</span>{tag}
+    </h1>
+    <p class="text-muted text-lg mt-4">
+      {posts.length} post{posts.length === 1 ? "" : "s"} tagged <code class="text-accent">{tag}</code>.
+    </p>
+  </section>
+
+  <section class="container-wide pb-20">
+    <div class="grid md:grid-cols-2 gap-5">
+      {posts.map((post) => (
+        <BlogCard
+          href={`/blog/${post.slug}`}
+          title={post.data.title}
+          tagline={post.data.tagline}
+          date={post.data.date}
+          readTime={post.data.readTime}
+          tags={post.data.tags}
+          featured={post.data.featured}
+        />
+      ))}
+    </div>
+  </section>
+</BaseLayout>

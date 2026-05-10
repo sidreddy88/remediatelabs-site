@@ -1,0 +1,53 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+---
+
+<BaseLayout
+  title="About — Remediate Labs"
+  description="About Siddharth Sukumar and the Remediate Labs project."
+>
+  <section class="container-prose pt-16 pb-20">
+    <h1 class="text-4xl font-semibold tracking-tight text-ink">About</h1>
+
+    <div class="prose prose-invert max-w-none mt-8">
+      <p>
+        I'm <strong>Siddharth Sukumar</strong>. I build agent systems for production —
+        specifically, ones that have to work reliably without a human in the loop on every step.
+      </p>
+
+      <p>
+        Remediate Labs is the latest version of that work: a multi-agent platform that watches a
+        production deployment, catches errors, diagnoses them against the actual codebase, and
+        opens fix PRs. It's been the centerpiece of my engineering work for the last several
+        months. The blog covers what I've learned shipping it.
+      </p>
+
+      <h2>What I'm working on</h2>
+      <ul>
+        <li>
+          <strong>agent-platform</strong> — the system at <a href="https://app.remediatelabs.io" target="_blank" rel="noopener">app.remediatelabs.io</a>.
+          5 agents, FastAPI, Postgres + pgvector, ECS Fargate.
+          <a href="/projects/agent-platform">Architecture deep-dive →</a>
+        </li>
+        <li>
+          <strong>Writing</strong> — debugging stories and architecture posts on the
+          <a href="/blog">blog</a>.
+        </li>
+      </ul>
+
+      <h2>What I look for</h2>
+      <p>
+        I'm interested in AI Engineer / agent systems roles where the work involves:
+        production-grade agent design, retrieval architecture, eval-driven decisions on model and
+        prompt changes, and observability for non-deterministic systems.
+      </p>
+
+      <h2>Get in touch</h2>
+      <ul>
+        <li>Email — <a href="mailto:sidreddy88@gmail.com">sidreddy88@gmail.com</a></li>
+        <li>GitHub — <a href="https://github.com/sidreddy88" target="_blank" rel="noopener">sidreddy88</a></li>
+        <li>Live demo — <a href="https://app.remediatelabs.io" target="_blank" rel="noopener">app.remediatelabs.io</a></li>
+      </ul>
+    </div>
+  </section>
+</BaseLayout>

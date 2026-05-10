@@ -1,0 +1,51 @@
+---
+import BaseLayout from "../../layouts/BaseLayout.astro";
+import BlogCard from "../../components/BlogCard.astro";
+import { getCollection } from "astro:content";
+
+const posts = (await getCollection("blog")).sort(
+  (a, b) => b.data.date.valueOf() - a.data.date.valueOf()
+);
+
+const allTags = Array.from(
+  new Set(posts.flatMap((p) => p.data.tags))
+).sort();
+---
+
+<BaseLayout
+  title="Blog — Remediate Labs"
+  description="Engineering writing on agent architecture, retrieval, debugging, and production systems."
+>
+  <section class="container-wide pt-16 pb-8">
+    <h1 class="text-4xl sm:text-5xl font-semibold tracking-tight text-ink">Engineering blog</h1>
+    <p class="text-muted text-lg mt-4 max-w-2xl">
+      Notes from building Remediate Labs — agent architecture, retrieval design, debugging
+      stories, and the unglamorous decisions that make production agents actually work.
+    </p>
+
+    <div class="flex flex-wrap gap-2 mt-8">
+      <span class="pill-accent">All</span>
+      {allTags.map((tag) => (
+        <a href={`/blog/tag/${tag}`} class="pill no-underline hover:border-accent hover:text-accent">
+          {tag}
+        </a>
+      ))}
+    </div>
+  </section>
+
+  <section class="container-wide pb-20">
+    <div class="grid md:grid-cols-2 gap-5">
+      {posts.map((post) => (
+        <BlogCard
+          href={`/blog/${post.slug}`}
+          title={post.data.title}
+          tagline={post.data.tagline}
+          date={post.data.date}
+          readTime={post.data.readTime}
+          tags={post.data.tags}
+          featured={post.data.featured}
+        />
+      ))}
+    </div>
+  </section>
+</BaseLayout>

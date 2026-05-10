@@ -1,0 +1,113 @@
+---
+title: "Typed Boundaries Make Multi-Agent Systems Readable"
+tagline: "Where you put parsing logic decides whether your orchestrator stays readable as agents multiply. Parse at the boundary, not in the caller."
+date: 2026-04-20
+tags: ["architecture", "agents"]
+readTime: 4
+---
+
+There's a design decision in multi-agent systems that nobody talks about, but you feel it immediately when you get it wrong: where do you put your parsing logic?
+
+When I was building a PR automation system, I had an `IncidentLoop` — the main pipeline that coordinated triage, diagnosis, fix generation, and deployment. Early on, `IncidentLoop` looked like this:
+
+```python
+# IncidentLoop — before
+result = await self._triage.run(prompt_string)
+answer = result.answer  # raw string: '{"decision": "real", "severity": "high", ...}'
+parsed = json.loads(answer)
+if parsed["decision"] == "noise":
+    return
+severity = parsed["severity"]
+```
+
+It worked. But `IncidentLoop` was doing three different jobs: managing the pipeline, building prompts, and parsing JSON. Every agent added more of that noise. By the time I had four agents wired up, the orchestrator was unreadable.
+
+The fix was a single design rule: **parse at the boundary, not in the caller.**
+
+---
+
+## What "typed boundary" means
+
+A typed boundary is just a method that takes a real domain object as input and returns a real domain object as output — not raw strings in, raw strings out.
+
+`TriageAgent` has one:
+
+```python
+async def triage(self, event: ErrorEvent) -> TriageResult:
+    # Build the prompt from typed input
+    prompt = f"""You are a triage agent...
+    error_type: {event.error_type}
+    title: {event.title}"""
+
+    # Run the ReAct loop
+    result = await self.run(prompt)
+
+    # Parse raw output into typed result
+    return _parse_triage_result(result.answer)
+```
+
+`IncidentLoop` now looks like this:
+
+```python
+# IncidentLoop — after
+result = await self._triage.triage(event)
+if result.decision == "noise":   # typed field, no parsing
+    return
+```
+
+The orchestrator doesn't know what a prompt looks like. It doesn't know the LLM returns JSON. It just passes an `ErrorEvent` and gets a `TriageResult` back — with `.decision`, `.severity`, `.occurrences_24h` as real typed fields.
+
+All the messy conversion work — prompt formatting, JSON parsing, dataclass construction — lives inside `triage()`. One place, owned by the agent.
+
+---
+
+## When you don't need a typed boundary
+
+Not every agent needs this. `CICDAgent` takes a plain string and returns a plain string — the caller just wants the raw answer text. There's no typed conversion needed.
+
+In that case, you skip the wrapper and override `run()` directly:
+
+```python
+# CICDAgent
+async def run(self, user_input: str) -> AgentResult:
+    params = json.loads(user_input)
+    prompt = f"Analyze CI/CD failures for {params['owner']}/{params['repo']}..."
+    return await super().run(prompt)
+```
+
+The decision comes down to two questions:
+
+| Question | Yes | No |
+|---|---|---|
+| Is my input a typed domain object? | Wrapper method | Override `run()` |
+| Is my output a typed domain object? | Wrapper method | Override `run()` |
+
+If both answers are no — the input is already a string, the caller just needs the raw answer — there's nothing to wrap. Override `run()` only if you need to reshape the prompt before the loop starts.
+
+If either answer is yes, put a typed boundary there.
+
+---
+
+## Why this matters more in agent systems
+
+In a regular service, messy parsing in the caller is annoying but manageable. In a multi-agent pipeline it compounds fast. Each agent adds LLM output that needs parsing. Each agent has its own prompt format. If the orchestrator owns all of that, it becomes the most fragile file in the codebase — the one where every change to every agent also means a change to the pipeline.
+
+Typed boundaries fix this by making each agent fully own its interface. The orchestrator becomes a clean sequence of typed calls:
+
+```python
+triage_result   = await self._triage.triage(event)
+diagnosis       = await self._diagnosis.diagnose(incident)
+fix_result      = await self._fix.fix(incident)
+```
+
+Each of those methods handles its own prompt building and output parsing internally. The pipeline reads like a business process, not like a JSON parsing script.
+
+---
+
+## The broader principle
+
+This isn't specific to agents — it's a general rule about where to put conversion logic. Parse at the boundary of the component that owns the data format. Don't push that work onto the caller.
+
+In agent systems it just matters more, because the data formats are messier (LLM outputs are strings that contain JSON that contains structured data) and the pipelines are longer. Every layer you skip makes the orchestrator harder to read and the agent harder to reuse.
+
+The test is simple: can your orchestrator be read without knowing anything about how any individual agent works? If yes, your boundaries are in the right place.

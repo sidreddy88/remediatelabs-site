@@ -1,0 +1,159 @@
+---
+title: "My Agent Ran for 58 Seconds and Made Up Every Number"
+tagline: "How a CICDAgent fabricated a confident CI failure report without calling a single tool — and the four trace signals that would have caught it sooner."
+date: 2026-04-20
+tags: ["debugging", "agents", "observability"]
+readTime: 6
+seeAlso: ["prompt-constraints-loop"]
+---
+
+The CI failure report looked real. Specific run IDs, branch names, timestamps, a confident root cause analysis. The kind of output that makes you think the agent is working.
+
+It wasn't. The agent had never called a single tool. It spent 58 seconds generating a detailed, fabricated report entirely from memory — and nothing in the output text gave it away.
+
+Here's how I figured it out, and what I changed to stop it happening again.
+
+---
+
+## The setup
+
+I was building a `CICDAgent` — an agent that analyzes CI/CD failures for a GitHub repo. Given a repo and a run ID, it should call `get_workflow_runs`, pull logs with `get_run_logs`, run `analyze_failure`, and produce a real diagnosis from real data.
+
+I was testing it against `actions/runner` — a popular public GitHub repo — and the outputs looked great. Detailed, structured, plausible.
+
+Then I checked Langfuse.
+
+---
+
+## The four signals that tell you an agent hallucinated
+
+Every agent trace in Langfuse has a top-level span with nested child spans for each tool call. Before reading anything else, I check four numbers:
+
+| Signal | Healthy | Red Flag |
+|---|---|---|
+| Span count | Multiple (agent + tool children) | 1 span only, no children |
+| Iterations | 4–8 for a real diagnosis | 1 — went straight to Answer |
+| Duration | 500ms–60s | 2–5ms (mock) or 58s + 1 iteration |
+| Answer | Cites specific tool results | Specific data with no source |
+
+A healthy trace looks like this:
+
+```
+IncidentResponseAgent (agent)
+├── gather_context (tool)
+├── check_recent_deployments (tool)
+├── search_logs (tool)
+├── generate_diagnosis (tool)
+└── request_action_approval (tool)
+```
+
+The `CICDAgent` trace looked like this:
+
+```
+CICDAgent (agent)
+```
+
+One span. No children. `iterations: 1`.
+
+Whatever was in the answer field was made up.
+
+---
+
+## What 58 seconds with 1 iteration actually means
+
+The duration confused me at first. 58 seconds feels like real work. But the signal isn't duration alone — it's duration *relative to iterations and span count*.
+
+A real agent run with 5 tool calls (GitHub API, CloudWatch logs, etc.) might take 30–60 seconds. But it would show 5+ child spans. One span at 58 seconds means the LLM made a single API call and spent the entire time generating one long response. No tools. Just text.
+
+The answer gave it away once I knew what to look for:
+
+- Specific version numbers with no source: `"rollback to v1.2.3"`
+- Branch names that weren't in the input: `"feat/improve-logging"`
+- Run IDs that differed from what I'd requested
+- Timestamps the LLM couldn't have known
+
+Real answers look different. They cite tool errors: *"AccessDeniedException on /ecs/TaskAllInterviews."* They contain numbers that came from API responses, not round estimates.
+
+---
+
+## The root cause: one line in base.py
+
+Once I knew the agent had hallucinated, the question was why. The prompt told it to call tools. Why did it skip them?
+
+The answer was in `base.py` — the ReAct loop's system prompt:
+
+```
+When you have enough information to answer the user, output:
+Answer: <your final answer>
+```
+
+That's the escape hatch. The loop gives the LLM permanent permission to skip all tools if it thinks it already knows the answer.
+
+`actions/runner` is one of the most-starred repos on GitHub. The LLM's training data includes extensive knowledge of it — common CI failures, branch naming conventions, typical run IDs. When it received a prompt asking it to analyze CI failures for that repo, it recognized the pattern, decided it "had enough information," and wrote a complete report from memory.
+
+The prompt hadn't told it not to. The instructions were written as suggestions:
+
+```python
+prompt = (
+    f"Analyze CI/CD failures for {owner}/{repo}. "
+    "First list recent workflow runs to identify failures. "
+    "Then fetch logs for the most recent failed run..."
+)
+```
+
+*"First list..."*, *"Then fetch..."* — natural language the LLM could freely ignore. Nothing said: *you cannot answer without calling these tools first.*
+
+---
+
+## The fix: close the escape hatch explicitly
+
+```python
+prompt = (
+    f"Analyze CI/CD failures for {owner}/{repo}. "
+    "MANDATORY CONSTRAINTS:\n"
+    "- You MUST call get_workflow_runs before any other tool or your Answer.\n"
+    "- You MUST call get_run_logs and analyze_failure before writing your Answer.\n"
+    "- Never produce a CI failure report from memory — all data must come from tool results.\n"
+    "- If a specific run_id is not found, say so clearly and analyze the most recent failure instead.\n"
+)
+```
+
+Four changes, each doing something specific:
+
+1. **"MUST"** — unambiguous obligation instead of "First..." which reads as a suggestion
+2. **"before writing your Answer"** — directly references the escape hatch and closes it
+3. **"Never produce a report from memory"** — names the bad behavior explicitly so the LLM recognizes it
+4. **"all data must come from tool results"** — tells the LLM what counts as valid data
+
+After this change, the trace looked right:
+
+```
+CICDAgent (agent)
+├── get_workflow_runs (tool)
+├── get_run_logs (tool)
+└── analyze_failure (tool)
+```
+
+`iterations: 4`. Duration: 34 seconds. Answer cited actual run IDs from the API response.
+
+---
+
+## The quick checklist
+
+When I look at a new agent trace now, I go through these in order:
+
+1. **How many spans?** → 1 = hallucination, multiple = real work done
+2. **Does iterations match span count?** → mismatch = skipped steps
+3. **What's the duration?** → &lt;10ms = test/mock run; 58s + 1 iteration = hallucination
+4. **Is the repo/input the real one?** → placeholder input = test payload, expect fabricated output
+5. **Does the answer cite specific data?** → vague/generic = made up
+
+---
+
+## The broader lesson
+
+The ReAct loop is designed to be flexible — the LLM can decide which tools to call and when. That flexibility is a feature. But it means the LLM can always decide that it doesn't need to call any tools at all.
+
+For agents where certain tool calls are non-negotiable, you have to say so explicitly in the prompt. Suggestions get ignored. MANDATORY CONSTRAINTS don't.
+
+And when something looks wrong, open Langfuse before reading the answer. The span tree tells you what actually happened. The answer just tells you what the LLM wrote.

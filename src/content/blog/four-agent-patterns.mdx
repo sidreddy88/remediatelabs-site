@@ -1,0 +1,193 @@
+---
+title: "Four Patterns for Structuring Agents (Part 2)"
+tagline: "Once you accept ReAct isn't the default, what do you use? Four structural patterns that emerged from building a 5-agent PR automation system."
+date: 2026-04-20
+tags: ["architecture", "agents"]
+readTime: 6
+seeAlso: ["not-every-agent-needs-react"]
+---
+
+*Part 1 covered why not every agent needs a ReAct loop. This post goes deeper — into the four structural patterns I landed on while building a PR automation system, and how to pick the right one.*
+
+---
+
+Once you accept that ReAct isn't the default, the next question is: okay, so what do I use?
+
+After building out several agents — triage, diagnosis, code review, fix generation, CI/CD analysis — I noticed the same four structures showing up. Each one answers two questions differently:
+
+1. Are the steps always the same sequence, or does the LLM decide what to do next?
+2. Does the caller need typed domain objects, or are plain strings fine?
+
+Here's the map.
+
+---
+
+## Pattern 1: ReAct Loop + Typed Wrapper
+
+**Used by:** TriageAgent, DiagnosisAgent
+
+**When to use:** Steps are dynamic (LLM decides which tools to call and in what order), AND the caller needs to pass/receive typed domain objects — not raw strings.
+
+The agent runs the full ReAct loop. A wrapper method handles the conversion in both directions: typed input → prompt string going in, raw string → typed output coming out.
+
+```python
+# TriageAgent
+async def triage(self, event: ErrorEvent) -> TriageResult:
+    # Convert typed input to a prompt
+    prompt = f"""You are a triage agent...
+    error_type: {event.error_type}
+    title: {event.title}"""
+
+    # Run the ReAct loop (inherited from BaseAgent)
+    result = await self.run(prompt)
+
+    # Parse raw string answer into typed output
+    return _parse_triage_result(result.answer)
+```
+
+The caller (IncidentLoop) passes an `ErrorEvent` and gets a `TriageResult` back. It never touches prompt formatting or JSON parsing. The wrapper owns that boundary.
+
+The LLM decides: which tools to call, in what order, and what to put in the final answer.
+
+---
+
+## Pattern 2: ReAct Loop + Override `run()`
+
+**Used by:** CICDAgent, IncidentResponseAgent
+
+**When to use:** Steps are dynamic, AND the caller just wants a plain string back — no typed output needed. But you need to reshape the prompt or inject constraints before the loop runs.
+
+```python
+# CICDAgent
+async def run(self, user_input: str) -> AgentResult:
+    params = json.loads(user_input)
+    prompt = (
+        f"Analyze CI/CD failures for {params['owner']}/{params['repo']}. "
+        "MANDATORY CONSTRAINTS:\n"
+        "- Call get_workflow_runs exactly once as your first tool call.\n"
+        "- You MUST call get_run_logs and analyze_failure before writing your Answer.\n"
+    )
+    return await super().run(prompt)
+```
+
+The key addition here is **MANDATORY CONSTRAINTS**. Without them, the ReAct loop has an escape hatch — the LLM can decide it "has enough information" and write an Answer after zero tool calls, pulling from training data instead of real results. If your agent needs to call specific tools before answering, make that explicit.
+
+---
+
+## Pattern 3: Direct Sequential Calls (No ReAct Loop)
+
+**Used by:** CodeReviewAgent, FixGenerationAgent
+
+**When to use:** The steps are always the same sequence. There's no decision to make about what to do next.
+
+```python
+# CodeReviewAgent
+async def run(self, user_input: str) -> AgentResult:
+    params = json.loads(user_input)
+    owner, repo, pr_number = params["owner"], params["repo"], int(params["pr_number"])
+
+    # Step 1: ALWAYS fetch the PR first
+    pr_summary = await fetch_pr(owner, repo, pr_number, self._github)
+
+    # Step 2: ALWAYS analyze every changed file
+    for filename in files:
+        analysis = await analyze_file(filename, self._github, self._llm)
+
+    # Step 3: ALWAYS generate and post the review
+    review = await generate_review(owner, repo, pr_number, ..., self._github, self._llm)
+
+    return AgentResult(answer=review, steps=[], iterations=3)
+```
+
+`super().run()` is never called. The ReAct loop is bypassed entirely.
+
+Why? If you handed this to a ReAct loop, the LLM might skip `analyze_file` for some files because it "has enough context." Or call `generate_review` before finishing the analysis. The steps are deterministic — there's no reason to let the LLM decide the order and risk it getting creative.
+
+`FixGenerationAgent` takes this further — it doesn't even register any ReAct tools. It extends `BaseAgent` purely to get access to `self._llm`. Everything else is direct Python and GitHub API calls.
+
+---
+
+## Pattern 4: Hybrid (Fixed Outer Sequence, LLM Inside Each Step)
+
+**Used by:** RequirementsAgent
+
+**When to use:** The outer sequence is deterministic, but each step involves real reasoning — not just a fetch or a check.
+
+```python
+# Each tool is itself a focused LLM call
+async def analyze_requirement(requirement: str, llm: LLMService) -> str:
+    return await llm.complete(messages=[...])
+
+async def estimate_effort(analysis: str, llm: LLMService) -> str:
+    return await llm.complete(messages=[...])
+
+async def generate_spec(requirement, analysis, estimate, llm) -> str:
+    return await llm.complete(messages=[...])
+```
+
+The outer order is always: analyze → estimate → generate spec. That never changes. But each step is its own focused LLM call — not a fetch, not a rule, but actual reasoning over the inputs.
+
+This is different from Pattern 1 because the step order here isn't dynamic. The ReAct loop just provides scaffolding. The real work happens inside each tool.
+
+---
+
+## Picking the Right Pattern
+
+| Question | Answer | Pattern |
+|---|---|---|
+| Are the steps always the same sequence? | Yes | Pattern 3 |
+| Does the LLM decide which tools to call? | Yes, and caller needs typed output | Pattern 1 |
+| Does the LLM decide which tools to call? | Yes, plain strings are fine | Pattern 2 |
+| Fixed outer sequence, but LLM reasoning per step? | Yes | Pattern 4 |
+
+---
+
+## The mistakes worth avoiding
+
+**Using ReAct for deterministic steps.** If you always call tool A, then B, then C — don't use the ReAct loop. The LLM will occasionally reorder or skip steps. Use Pattern 3 and call them directly.
+
+**Skipping MANDATORY CONSTRAINTS.** When using Patterns 1 or 2, the LLM can always decide it knows enough and skip tools entirely. If certain tools are non-negotiable, say so explicitly in the prompt.
+
+**Throwing exceptions from tools instead of returning error strings.**
+
+```python
+# Wrong — breaks the conversation
+async def _my_tool(query: str) -> str:
+    result = await self._aws.search(query)
+    if not result:
+        raise ValueError("No results found")  # ❌
+
+# Right — LLM can reason about the failure and try something else
+async def _my_tool(query: str) -> str:
+    result = await self._aws.search(query)
+    if not result:
+        return "No results found for this query."  # ✓
+```
+
+The LLM reads tool outputs as Observations. An exception breaks that flow. An error string lets the LLM adapt.
+
+**Missing the Input schema in tool descriptions.**
+
+```python
+# Bad — Claude doesn't know what JSON to send
+"Search CloudWatch logs for errors"
+
+# Good — Claude knows exactly what fields to include
+"Search CloudWatch logs for a pattern. Input: {log_group: string, pattern: string, minutes: integer (optional, default 60)}"
+```
+
+---
+
+## Model selection
+
+One last thing that doesn't get talked about enough: not every agent should use the same model.
+
+TriageAgent runs on every single alert — it needs to be fast and cheap. It uses Haiku.
+
+DiagnosisAgent, CICDAgent, CodeReviewAgent only run when something is confirmed real. They need deep reasoning. They use Sonnet.
+
+The rule: if it runs on every event, optimize for speed and cost. If it runs on confirmed signal, optimize for quality.
+
+---
+
+The four patterns aren't a rigid taxonomy — they're a lens for asking "what does this agent actually need?" Once that question is clear, the structure usually follows naturally.

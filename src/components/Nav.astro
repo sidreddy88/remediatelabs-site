@@ -1,0 +1,39 @@
+---
+const links = [
+  { href: "/", label: "Home" },
+  { href: "/projects/agent-platform", label: "Project" },
+  { href: "/blog", label: "Blog" },
+  { href: "/about", label: "About" },
+];
+const path = Astro.url.pathname;
+---
+
+<nav class="border-b border-border bg-bg/80 backdrop-blur sticky top-0 z-30">
+  <div class="container-wide flex h-14 items-center justify-between">
+    <a href="/" class="flex items-center gap-2 text-ink hover:text-ink no-underline">
+      <span class="inline-block h-2 w-2 rounded-full bg-accent"></span>
+      <span class="font-semibold tracking-tight">Remediate Labs</span>
+    </a>
+    <div class="flex items-center gap-6 text-sm">
+      {links.slice(1).map((link) => {
+        const active = path === link.href || (link.href !== "/" && path.startsWith(link.href));
+        return (
+          <a
+            href={link.href}
+            class={active ? "text-ink" : "text-muted hover:text-ink"}
+          >
+            {link.label}
+          </a>
+        );
+      })}
+      <a
+        href="https://github.com/sidreddy88/agent-platform"
+        target="_blank"
+        rel="noopener"
+        class="text-muted hover:text-ink"
+      >
+        GitHub
+      </a>
+    </div>
+  </div>
+</nav>

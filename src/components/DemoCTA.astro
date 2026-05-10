@@ -1,0 +1,21 @@
+---
+const demoEnabled = import.meta.env.PUBLIC_DEMO_ENABLED !== "false";
+---
+
+{demoEnabled ? (
+  <a
+    href="https://app.remediatelabs.io"
+    target="_blank"
+    rel="noopener"
+    class="inline-flex items-center justify-center rounded-md bg-accent px-5 py-3 text-sm font-semibold text-bg hover:bg-accent/90 transition-colors no-underline"
+  >
+    Try the live demo →
+  </a>
+) : (
+  <a
+    href="mailto:sidreddy88@gmail.com?subject=Remediate%20Labs%20walkthrough"
+    class="inline-flex items-center justify-center rounded-md border border-accent/40 bg-accent/10 px-5 py-3 text-sm font-semibold text-accent hover:bg-accent/20 transition-colors no-underline"
+  >
+    Request a walkthrough →
+  </a>
+)}

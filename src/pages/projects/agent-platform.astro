@@ -1,0 +1,185 @@
+---
+import BaseLayout from "../../layouts/BaseLayout.astro";
+import DemoCTA from "../../components/DemoCTA.astro";
+
+const stack = [
+  { layer: "Agent runtime", value: "Anthropic SDK · Claude Opus 4.6 / Sonnet 4.6 / Haiku 4.5" },
+  { layer: "Web framework", value: "FastAPI · WebSocket streaming · Pydantic v2" },
+  { layer: "Storage", value: "Postgres (SQLAlchemy Core) · pgvector for RAG" },
+  { layer: "Sandbox", value: "Docker Compose · Jest · mongodb-memory-server" },
+  { layer: "Tracing", value: "Langfuse — every LLM call + tool execution as nested spans" },
+  { layer: "Resilience", value: "Circuit breakers · schema validation at handoffs · context checkpointing" },
+  { layer: "Deploy", value: "AWS ECS Fargate · ALB · Cloudflare · GitHub Actions OIDC" },
+  { layer: "Frontend", value: "React + Vite · WebSocket dashboard · served from same container" },
+];
+
+const agents = [
+  { name: "TriageAgent", role: "Classifies events as real / noise / duplicate. P0–P3 severity. Haiku for cost.", pattern: "ReAct + typed wrapper" },
+  { name: "DiagnosisAgent", role: "Roots every claim against the live repo via GitHub Code Search.", pattern: "ReAct + grounding guards" },
+  { name: "FixGenerationAgent", role: "Writes the patch. Runs it in a Docker sandbox. Retries 3× on test failure.", pattern: "Direct LLM + sandbox loop" },
+  { name: "CodeReviewAgent", role: "Self-critique pass before opening the PR. Catches obvious regressions.", pattern: "Direct LLM" },
+  { name: "MonitorGenerationAgent", role: "On PR merge, generates new CloudWatch alarms for new code paths.", pattern: "ReAct + dry-run tools" },
+];
+---
+
+<BaseLayout
+  title="Project: agent-platform — Remediate Labs"
+  description="Architecture deep-dive of the multi-agent incident remediation pipeline: data flow, agent patterns, deployment topology, and production trade-offs."
+>
+  <section class="container-wide pt-16 pb-12">
+    <a href="/" class="text-sm text-muted hover:text-ink">← Home</a>
+    <h1 class="text-4xl sm:text-5xl font-semibold tracking-tight text-ink mt-4">
+      agent-platform
+    </h1>
+    <p class="text-muted text-lg mt-4 max-w-3xl leading-relaxed">
+      A 5-agent pipeline that detects production errors, grounds the diagnosis against the actual
+      repo, generates a patch, validates it in a Docker sandbox, and opens a PR — all before
+      anyone gets paged. Designed around three constraints: zero polling load on production,
+      no fabricated symbols in fixes, and human approval for anything HIGH/CRITICAL.
+    </p>
+    <div class="flex flex-col sm:flex-row gap-3 mt-8">
+      <DemoCTA />
+      <a
+        href="https://github.com/sidreddy88/agent-platform"
+        target="_blank"
+        rel="noopener"
+        class="inline-flex items-center justify-center rounded-md border border-border bg-surface px-5 py-3 text-sm font-medium text-ink hover:border-accent transition-colors no-underline"
+      >
+        Source on GitHub →
+      </a>
+    </div>
+  </section>
+
+  <section class="container-wide py-12 border-t border-border">
+    <h2 class="text-2xl font-semibold tracking-tight text-ink mb-6">Pipeline</h2>
+    <div class="rounded-lg border border-border bg-surface/40 p-6 overflow-x-auto">
+      <pre class="text-sm text-muted leading-7 font-mono"><code>{`CloudWatch alarm  ─►  SNS  ─►  /webhooks/cloudwatch-alarm
+                                       │
+                                       ▼
+                              ┌────────────────┐
+                              │  Dedup gate    │  string-match · SQL · RAG (live store lookup)
+                              └────────┬───────┘
+                                       │   (new event)
+                                       ▼
+                              ┌────────────────┐
+                              │  TriageAgent   │  real / noise / duplicate · P0–P3
+                              └────────┬───────┘
+                                       │   (real, ≥ P2)
+                                       ▼
+                              ┌────────────────┐
+                              │ DiagnosisAgent │  grounds every symbol against the live repo
+                              └────────┬───────┘
+                                       ▼
+                              ┌────────────────┐
+                              │FixGeneration   │  writes patch · sandbox test · retry 3×
+                              └────────┬───────┘
+                                       ▼
+                              ┌────────────────┐
+                              │ CodeReview     │  self-critique → open PR
+                              └────────┬───────┘
+                                       ▼
+                              ┌────────────────┐
+                              │ Approval gate  │  HIGH/CRITICAL → human · merge → MonitorGen
+                              └────────────────┘`}</code></pre>
+    </div>
+  </section>
+
+  <section class="container-wide py-12 border-t border-border">
+    <h2 class="text-2xl font-semibold tracking-tight text-ink mb-6">The agents</h2>
+    <div class="grid md:grid-cols-2 gap-4">
+      {agents.map((a) => (
+        <div class="rounded-lg border border-border bg-surface/40 p-5">
+          <div class="flex items-baseline justify-between gap-3">
+            <h3 class="text-base font-semibold text-ink font-mono">{a.name}</h3>
+            <span class="pill text-[10px]">{a.pattern}</span>
+          </div>
+          <p class="text-sm text-muted mt-2 leading-relaxed">{a.role}</p>
+        </div>
+      ))}
+    </div>
+  </section>
+
+  <section id="metrics" class="container-wide py-12 border-t border-border">
+    <h2 class="text-2xl font-semibold tracking-tight text-ink mb-6">How the metrics are computed</h2>
+    <ul class="space-y-4 text-muted leading-relaxed">
+      <li>
+        <strong class="text-ink">Time-to-first-PR</strong> — wall-clock from CloudWatch alarm
+        webhook receipt to GitHub PR creation. Decomposed in
+        <code class="text-accent">scripts/measure_mttr.py</code> into
+        agent-bound (LLM + tool latency) vs human-bound (approval queue) so the agent number is
+        attributable.
+      </li>
+      <li>
+        <strong class="text-ink">Triage accuracy</strong> — TriageAgent run against
+        <code class="text-accent">app/evals/golden_dataset.jsonl</code> (100+ labelled cases:
+        real/noise/duplicate × P0–P3). Eval runner isolates the agent from live AWS via stubs.
+      </li>
+      <li>
+        <strong class="text-ink">False-positive rate</strong> — fraction of incoming events
+        classified as real that turned out to be noise on human review. Captured into the
+        golden dataset so the next eval has a higher bar.
+      </li>
+      <li>
+        <strong class="text-ink">Sample size</strong> — production incidents in
+        <code class="text-accent">agent_platform.db</code> from the live deploy. Refreshed
+        whenever <code class="text-accent">measure_mttr.py</code> is re-run.
+      </li>
+    </ul>
+  </section>
+
+  <section class="container-wide py-12 border-t border-border">
+    <h2 class="text-2xl font-semibold tracking-tight text-ink mb-6">Tech stack</h2>
+    <div class="rounded-lg border border-border overflow-hidden">
+      <table class="w-full text-sm">
+        <tbody>
+          {stack.map((row, i) => (
+            <tr class={i % 2 === 0 ? "bg-surface/40" : ""}>
+              <td class="px-5 py-3 font-mono text-muted text-xs uppercase tracking-wider whitespace-nowrap">
+                {row.layer}
+              </td>
+              <td class="px-5 py-3 text-ink">{row.value}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="container-wide py-12 border-t border-border">
+    <h2 class="text-2xl font-semibold tracking-tight text-ink mb-6">Design decisions worth defending</h2>
+    <ol class="space-y-5 text-muted leading-relaxed list-decimal list-inside">
+      <li>
+        <strong class="text-ink">Push, not poll.</strong> CloudWatch alarms → SNS → HTTPS webhook.
+        Zero polling load on the production server. Detection latency drops from
+        ~7d (human attention) to single-digit minutes.
+      </li>
+      <li>
+        <strong class="text-ink">RAG finds candidates. The live store confirms truth.</strong>
+        ChromaDB (and now pgvector) holds index-time snapshots; current incident state lives in
+        Postgres. Blocking decisions always re-read the live store —
+        <a href="/blog/live-store-vs-chromadb">the post explains why</a>.
+      </li>
+      <li>
+        <strong class="text-ink">Hard blocks are deterministic, soft hints are LLM-shaped.</strong>
+        Dedup is a hard block (drop the event); regression context is a soft hint (prompt
+        injection). Mixing the two created a four-failure-mode bug —
+        <a href="/blog/rag-dedup-failure">walked through here</a>.
+      </li>
+      <li>
+        <strong class="text-ink">Ground every symbol against the repo.</strong> DiagnosisAgent
+        runs <code class="text-accent">verify_symbol_in_repo</code> via GitHub Code Search; a
+        server-side guard re-checks every named function in the parsed output and rejects
+        fabricated camelCase identifiers.
+      </li>
+      <li>
+        <strong class="text-ink">Sandbox before PR.</strong> Every fix runs in a Docker
+        container against the real test suite. If tests fail, regenerate up to 3× before
+        opening any GitHub noise.
+      </li>
+      <li>
+        <strong class="text-ink">Approval gate for HIGH/CRITICAL.</strong> Configurable
+        risk threshold; rejections are logged as RLHF preference pairs.
+      </li>
+    </ol>
+  </section>
+</BaseLayout>

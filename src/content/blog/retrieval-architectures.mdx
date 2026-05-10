@@ -1,0 +1,224 @@
+---
+title: "The Three Camps of Retrieval Architecture: A Practical Guide"
+tagline: "Improved RAG, GraphRAG, Ragless. Each is right about something. Each is wrong applied to problems it wasn't designed for. A decision framework for picking the right default and extending deliberately."
+date: 2026-04-22
+tags: ["architecture", "rag"]
+readTime: 12
+featured: true
+---
+
+*Retrieval is not a solved problem. It is a design space. Here is how to navigate it.*
+
+---
+
+There is a quiet war happening in AI engineering teams right now. Not about which model to use, or whether to fine-tune. The war is about retrieval — how you get the right information in front of the model at the right time.
+
+Three schools of thought have emerged. Each is right about something. Each is wrong when applied to problems it was not designed for. This post explains what each camp believes, how it works under the hood, when to reach for it, and when to leave it alone.
+
+---
+
+## Camp One: Improved RAG
+
+### What It Is
+
+RAG — Retrieval-Augmented Generation — is the default answer to the question "how do I give a model access to my knowledge base?" The basic version is simple: chunk your documents, embed them, store them in a vector database, and at query time, retrieve the most similar chunks and pass them to the model as context.
+
+The problem is that the basic version is not good enough for production. It fails in predictable ways: wrong chunks, missed context, exact-term queries that confuse vector search. The first camp's answer is not to abandon RAG, but to engineer it seriously.
+
+**Improved RAG is RAG with the unglamorous work done.**
+
+### How It Works
+
+**Smarter chunking.** The naive approach splits text every N characters. This destroys semantic coherence — a chunk might start mid-sentence and end before the key insight. Better chunking respects boundaries: paragraphs, section headers, sentence endings. The goal is that each chunk can stand alone and answer a question without needing its neighbors for context.
+
+**Hybrid search.** Vector similarity search is powerful but has a blind spot: exact terms. A vector search for "GPT-4o" might return chunks about language models in general, because the embedding captures the concept, not the string. BM25 — the classical keyword search algorithm — handles exact terms well but cannot understand paraphrase or intent. The solution is to run both in parallel and merge the result lists. Reciprocal Rank Fusion (RRF) is the standard merging method: it combines rankings from both systems into a single ordered list without requiring you to normalize or tune scores across different scales.
+
+**Reranking.** Your hybrid search returns 50 candidate chunks. Not all 50 are equally relevant, and the ranking from the initial retrieval is imperfect. A cross-encoder reranker solves this by scoring each candidate against the actual query, not just comparing embeddings. This two-stage approach — cast a wide net with retrieval, get precise with reranking — consistently outperforms either stage alone. The retriever optimizes for recall; the reranker optimizes for precision.
+
+### The Stack
+
+- **Vector store**: Qdrant, Weaviate, or Pinecone for embedding storage and similarity search
+- **Keyword engine**: Elasticsearch or Typesense for BM25
+- **Reranker**: Cohere Rerank API, or a self-hosted `cross-encoder/ms-marco` model
+- **Fusion**: Reciprocal Rank Fusion to merge the two result lists
+
+### When to Use It
+
+Improved RAG is the right default for most production teams. Use it when:
+
+- Your knowledge base is large (thousands to millions of documents)
+- Queries are varied and unpredictable
+- You cannot curate and maintain the corpus manually
+- You need to handle both exact-term queries and intent-based queries
+- Your corpus updates frequently
+
+**Concrete examples**: customer support knowledge bases, internal documentation search, e-commerce product search, legal document retrieval, medical literature search.
+
+### When Not to Use It
+
+Do not reach for improved RAG when your queries are fundamentally relational ("what connects X and Y?") — that is Camp Two's domain. And do not use it for narrow, high-value corpora where you can afford to manually maintain the knowledge — that is where Camp Three wins.
+
+---
+
+## Camp Two: GraphRAG
+
+### What It Is
+
+GraphRAG starts from a different premise. It asks: what if the relationships between pieces of knowledge matter as much as the pieces themselves?
+
+Naive RAG treats your knowledge base as an unordered collection of text fragments. When you ask "what are the themes connecting these two research papers that never cite each other?", naive RAG fails — not because the chunks are bad, but because the answer lives in the relationship between documents, not inside any single one.
+
+GraphRAG extracts entities and relationships from your corpus, builds a graph structure, and lets the model reason over that structure instead of over raw text chunks.
+
+### How It Works
+
+**Entity and relationship extraction.** Every document in the corpus is processed to identify entities — people, concepts, organizations, events, technical terms — and the relationships between them. These relationships are typed: "cites", "contradicts", "extends", "caused", "is a type of". An LLM or a purpose-built NER model handles this extraction. The output is a set of (entity, relationship, entity) triples with provenance — a record of which document made the claim.
+
+**Graph construction.** These triples are loaded into a graph database. Each entity becomes a node. Each relationship becomes a typed, directed edge. Nodes accumulate attributes: their source documents, their frequency of mention, their connections. Microsoft's GraphRAG implementation adds an additional step — it clusters the graph into communities and generates summaries of each community, giving the model a hierarchical view of the knowledge.
+
+**Query-time reasoning.** When a query arrives, the system classifies it: does it require local retrieval (a specific fact about one entity) or global reasoning (a pattern or theme across the corpus)? For local queries, it traverses the graph to the relevant node and retrieves its context. For global queries, it queries across community summaries. The retrieved subgraph is passed to the model as context, enabling reasoning that spans documents.
+
+### The Stack
+
+- **Graph database**: Neo4j or Amazon Neptune for property graph storage
+- **Extraction**: LLM-based pipeline (GPT-4, Claude) or specialized NER models
+- **Reference implementation**: Microsoft's GraphRAG library (open source)
+- **Query layer**: Cypher (for Neo4j) generated by an LLM, or a purpose-built graph traversal layer
+
+### When to Use It
+
+GraphRAG is the right tool when relationships between documents matter more than any individual document. Use it when:
+
+- Your corpus is inherently relational (research papers, legal cases, codebases, knowledge graphs)
+- Users ask synthesis questions that span multiple documents
+- You need to discover non-obvious connections ("what do these two authors have in common?")
+- Provenance and reasoning chains matter — you need to show *why* two concepts are connected
+- Your domain has well-defined entity types and relationship structures
+
+**Concrete examples**: academic literature review tools, patent analysis, investigative journalism databases, competitive intelligence platforms, knowledge graph construction for enterprise AI.
+
+### When Not to Use It
+
+GraphRAG is expensive. Building the graph requires processing every document through an extraction pipeline — that is LLM calls at scale, which means cost and time. Maintaining the graph as documents change requires re-extraction and graph updates. And most teams discover halfway through implementation that their knowledge does not actually need graph reasoning. A well-organized product FAQ does not have relational structure worth modeling.
+
+Do not use GraphRAG unless:
+
+- You have validated that Camp One fails on relational queries
+- You can absorb the build and maintenance cost
+- Your corpus has genuine relational density
+
+---
+
+## Camp Three: Ragless
+
+### What It Is
+
+The name is slightly misleading. Ragless is not retrieval-free. It is retrieval at write time instead of query time.
+
+The core insight is this: the failure modes of RAG — wrong chunk retrieved, context split across multiple chunks, retrieval missing the point of the query — all happen at query time. What if you eliminated query-time retrieval entirely by pre-compiling the knowledge into a document designed to be read?
+
+Andrej Karpathy's personal wiki is the canonical example. He maintains a structured document that captures his knowledge about a domain. When he (or a model) wants to answer a question, it reads the document. No vector search. No chunking. No retrieval pipeline. The retrieval happened when he wrote and organized the document.
+
+### How It Works
+
+**Curated knowledge layer.** You maintain a document — or a small, organized set of documents — that captures what the model needs to know. This is not auto-generated from a corpus. It is written or curated by a human (or LLM-assisted and human-reviewed), with the explicit intent of being readable and useful to a model answering questions.
+
+**Write-time synthesis.** When new information arrives, you do not just append it. You integrate it: update the relevant section, revise outdated claims, add cross-references. The work of synthesis happens at write time, not at query time. This is expensive per-update but eliminates per-query retrieval cost.
+
+**Direct context injection.** When a query arrives, you load the relevant document (or the full document if it fits in context) directly into the model's context window. The model reads it as a human would read a briefing document — with full context, seeing how ideas connect, not guessing from fragments.
+
+**Modular organization.** For larger corpora, the ragless approach becomes a library of maintained documents, each covering a domain or sub-domain. A classifier determines which document to load for a given query. This scales further than a single document but still avoids per-query embedding and retrieval.
+
+### When to Use It
+
+Ragless is the right choice when you can afford to maintain the corpus and the domain is narrow enough that a curated document is feasible. Use it when:
+
+- The domain is high-value and relatively stable (internal team processes, personal knowledge, product specifications)
+- The corpus is small enough to fit in context, or modular enough to route to the right document
+- Accuracy matters more than scale — you need the model to have complete, coherent context
+- You have the discipline (or the tooling) to keep the document current
+- You are building for compounding returns — a well-maintained document gets better over time
+
+**Concrete examples**: personal knowledge management (Karpathy's wiki pattern), internal team wikis, product knowledge for customer-facing AI assistants, domain briefings for research agents, high-stakes narrow-domain Q&A.
+
+### When Not to Use It
+
+Ragless breaks down at scale. If your corpus has hundreds of thousands of documents updated by many contributors, manual curation is not feasible. It also breaks down when the domain is so broad that no document can cover it without becoming unwieldy.
+
+Do not use ragless for:
+
+- Large, frequently updated corpora
+- Domains where the scope of questions cannot be predicted
+- Teams without the discipline or tooling to maintain the knowledge layer
+
+---
+
+## Choosing Between the Three
+
+The wrong mental model is picking one and applying it everywhere. The right mental model is understanding each as a tool with a specific job.
+
+| Dimension | Improved RAG | GraphRAG | Ragless |
+|---|---|---|---|
+| **Corpus size** | Large to massive | Medium to large | Small to medium |
+| **Query type** | Factual, varied | Relational, synthetic | Factual, narrow |
+| **Maintenance cost** | Low (auto-indexed) | High (graph extraction) | Medium (manual curation) |
+| **Build complexity** | Medium | High | Low |
+| **Failure mode** | Wrong chunk, missed context | Graph staleness, over-engineering | Corpus drift, coverage gaps |
+| **Best for** | Production at scale | Research and analysis | Personal and high-value narrow domains |
+
+### A Decision Framework
+
+Start by asking what kind of queries you are serving:
+
+1. **Are queries relational?** Do users ask "what connects X and Y" or "what are the themes across this corpus?" → Start with GraphRAG.
+
+2. **Is the domain narrow and high-value?** Can a single person (or a maintained process) keep a curated document current? → Start with Ragless.
+
+3. **Everything else** → Improved RAG is your default.
+
+Once you are in production, watch for failure patterns. If your RAG system is missing relational queries that matter, add a graph layer. If your RAG system is retrieving wrong chunks for a specific high-value domain, add a ragless layer for that domain and route to it.
+
+The builders who ship well are not the ones who pick the best architecture upfront. They are the ones who start with the right default, observe where it fails, and extend deliberately — treating retrieval architecture as a design choice, not a religion.
+
+---
+
+## The Combined Stack
+
+For teams that want to support all three, the architecture looks like this:
+
+```
+Incoming query
+      │
+      ▼
+  Query Router (LLM classifier or intent model)
+      │
+      ├──► Relational query?  ──────► GraphRAG layer
+      │                                    │
+      ├──► Curated domain?   ──────► Ragless layer (load document)
+      │                                    │
+      └──► Everything else   ──────► Improved RAG (hybrid search + reranker)
+                                           │
+                                           ▼
+                                     Context assembled
+                                           │
+                                           ▼
+                                       LLM response
+```
+
+The router can be as simple as a few-shot prompt that classifies the query, or as sophisticated as a trained intent classifier if you have query volume.
+
+Build in this order:
+
+1. **Improved RAG first** — gets you to production and teaches you where the system fails
+2. **Ragless second** — for the narrow, high-value domains where curation is feasible; high ROI for low complexity
+3. **GraphRAG third** — only after observing relational failures in production that justify the build cost
+
+---
+
+## Closing Thought
+
+The retrieval problem is not going away. As models get longer context windows, some of the chunking problem softens — but you still need to decide what goes into that context. As models get smarter, they can reason over sparser context — but you still need to retrieve the right sparse context.
+
+The teams that build durable retrieval systems are the ones that understand each camp's theory of the problem, not just its implementation. Improved RAG is right that most retrieval is a ranking problem. GraphRAG is right that structure encodes information that flat text cannot. Ragless is right that write-time synthesis beats query-time guessing for curated knowledge.
+
+All three are correct. None of them alone is enough.
