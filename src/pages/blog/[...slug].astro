@@ -25,6 +25,9 @@ const { Content } = await post.render();
   tags={post.data.tags}
   readTime={post.data.readTime}
   seeAlso={post.data.seeAlso}
+  series={post.data.series}
+  seriesPart={post.data.seriesPart}
+  slug={post.slug}
 >
   <Content />
 </BlogPost>

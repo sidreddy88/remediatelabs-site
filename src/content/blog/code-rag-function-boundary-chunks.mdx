@@ -1,0 +1,240 @@
+---
+title: "Fixing the Chunking Split with Function-Boundary Chunks"
+tagline: "The function name query score jumps from 0.56 to 0.71. The natural language query goes from rank 3 to rank 1. Here's what changes when each function gets its own chunk."
+date: 2026-06-04
+tags: ["rag", "architecture", "debugging"]
+readTime: 8
+series: "Code RAG in Production"
+seriesPart: 3
+seeAlso: ["code-rag-search-quality"]
+---
+
+*Part of a series on building production RAG over a real JavaScript codebase. Part 2 found two failure modes: chunking split (functions split across line-count windows) and vocabulary gap (runtime errors not in source). This post fixes the first one.*
+
+---
+
+## The hypothesis
+
+Part 2 showed `moveAndRemoveFileFromS3` split across two 50-line chunks: the declaration in one, the body in the other. The hypothesis is simple: if each function gets its own chunk, search will work better because the embedding represents exactly one logical unit instead of half a function mixed with unrelated code.
+
+Before implementing anything, let's be precise about what "better" means:
+- The function should rank higher for natural language queries about what it does
+- The score for the function name query should go up (less dilution from surrounding code)
+- The vocabulary gap query (`NoSuchKey`) should remain unfixed — we're not touching that problem here
+
+---
+
+## The extractor
+
+The AllInterviews backend uses a consistent style for top-level functions:
+
+```javascript
+async function name(...) { ... }
+function name(...) { ... }
+```
+
+No arrow functions at the top level. That makes detection straightforward: match any line that starts with `(async )?function name(`, then use brace-depth tracking to find the closing `}`.
+
+```python
+func_re = re.compile(r'^(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(')
+
+i = 0
+while i < len(lines):
+    m = func_re.match(lines[i])
+    if m:
+        name = m.group(1)
+        start = i
+        depth = 0
+        found_open = False
+        for j in range(i, len(lines)):
+            for ch in lines[j]:
+                if ch == '{': depth += 1; found_open = True
+                elif ch == '}': depth -= 1
+            if found_open and depth <= 0:
+                yield FunctionChunk(name, start+1, j+1, content)
+                i = j + 1
+                break
+```
+
+Known limitation: brace characters inside string literals are counted. In practice this is rare in AllInterviews — most string content doesn't contain standalone `{` or `}`. A production-quality extractor would use a proper parser (tree-sitter). For this exercise, the simple approach works.
+
+---
+
+## What got extracted
+
+Running the extractor on `routes/services/image.js` (1026 lines):
+
+```
+Function                              Lines  Range
+--------------------------------------------------
+removeFile                               12  46–57
+generateKeyFromBaseKey                    5  59–63
+applyModification                        76  65–140
+handleCompression                        46  142–187
+compressAndUploadtoS3                    10  189–198
+getThumbnailForImage                     10  200–209
+...
+moveAndRemoveFileFromS3                  17  479–495   ← target
+slugify                                  15  497–511
+...
+s3ObjectExists                           11  603–613
+deleteImageVariantsFromS3                74  615–688
+...
+```
+
+35 functions extracted. The smallest is 5 lines (`generateKeyFromBaseKey`). The largest is 76 lines (`applyModification`). `moveAndRemoveFileFromS3` is 17 lines — a single, self-contained chunk.
+
+Notice what the extractor produced for the target function:
+
+```javascript
+// lines 479–495 — exactly one chunk, exactly the function
+async function moveAndRemoveFileFromS3(bucket, imageObj) {
+  try {
+    if (!imageObj.source || !imageObj.destination) return;
+    if (imageObj.source === imageObj.destination) return;
+
+    await s3
+      .copyObject({
+        Bucket: bucket,
+        CopySource: `${bucket}/${imageObj.source}`,
+        Key: `${imageObj.destination}`,
+      })
+      .promise();
+    await s3.deleteObject({ Bucket: bucket, Key: imageObj.source }).promise();
+  } catch (error) {
+    console.log("moveAndRemoveFileFromS3 error", error, bucket, imageObj);
+  }
+}
+```
+
+Compare this to what the line-based chunker produced:
+- Chunk 441–490: 38 lines of unrelated code + the first 12 lines of this function
+- Chunk 481–530: 15 lines of this function + 35 lines of unrelated code
+
+The function-boundary chunk has zero dilution. Every token in the embedding represents this function.
+
+---
+
+## The results
+
+Running the same four queries from Part 2 against both collections:
+
+```
+Query                               Line-based          Function-based
+----------------------------------------------------------------------
+moveAndRemoveFileFromS3             rank 1  (0.5596)    rank 1  (0.7093)
+copy S3 object then delete source   rank 3  (0.5035)    rank 1  (0.5719)
+S3 copyObject deleteObject bucket   rank 4  (0.5025)    rank 2  (0.5973)
+S3 NoSuchKey missing key error      not in top 5        not in top 5
+```
+
+Three improvements, one unchanged.
+
+---
+
+## Breaking down each result
+
+**Query 1: function name (`moveAndRemoveFileFromS3`)**
+
+Score jumps from 0.5596 to 0.7093 — a gain of +0.15. Same rank (1st), but the confidence is much higher.
+
+Why? The line-based chunk had the function name in the declaration once and in the error log once — but those 12 lines of signal were embedded alongside 38 lines of unrelated S3 upload logic. The function-boundary chunk has the function name in the declaration, in the error log, and the entire embedding is anchored to those tokens.
+
+**Query 2: natural language (`copy S3 object then delete source`)**
+
+Jumps from rank 3 to rank 1. This is the most important fix.
+
+The line-based rank 3 happened because lines 601–650 (`s3ObjectExists`, `deleteImageVariantsFromS3`) outscored the target — they also contain S3 deletion code and their chunks are less diluted. The function-boundary chunk for `moveAndRemoveFileFromS3` now has nothing but copy-and-delete S3 logic, so it beats both.
+
+**Query 3: API call names (`S3 copyObject deleteObject bucket key`)**
+
+Goes from rank 4 to rank 2. The function-boundary chunk scores 0.5973 vs 0.5025 — a gain of +0.095. Rank 1 is `deleteImageVariantsFromS3`, which calls `deleteObject` multiple times and is semantically very close to this query. That's correct behaviour — `deleteImageVariantsFromS3` is also relevant.
+
+**Query 4: incident vocabulary (`S3 NoSuchKey missing key error`)**
+
+Still not in top 5. As predicted in Part 2, this is the vocabulary gap problem. The function-boundary chunk still contains zero occurrences of "NoSuchKey". This confirms the two problems are independent: better chunking fixes dilution, not absence.
+
+---
+
+## Why the score jump from 0.56 to 0.71 matters
+
+The score gap between "correct answer" and "wrong answer" determines how safely you can threshold.
+
+With line-based chunking:
+
+```
+rank 1: 0.5596  moveAndRemoveFileFromS3 (declaration chunk — correct but diluted)
+rank 2: 0.5208  image.js:1-50 (import block — wrong)
+gap = 0.039
+```
+
+With function-boundary chunking:
+
+```
+rank 1: 0.7093  moveAndRemoveFileFromS3 (full function — correct)
+rank 2: ...     next result
+gap is much larger
+```
+
+A gap of 0.039 means a threshold of 0.55 would pass the correct answer but also pass the import block. A score of 0.71 for the correct answer with a large gap means a threshold of 0.65 confidently separates signal from noise.
+
+Same principle as what we found in the incident RAG series: score compression makes thresholds fragile; wider gaps make them reliable.
+
+---
+
+## The chunk count difference
+
+Line-based: 26 chunks for 1026 lines.
+Function-based: 35 chunks for 35 functions.
+
+More chunks, but each one is smaller and focused. Total token count is the same (same source code). The difference is that every chunk now has a clear semantic identity: "this chunk is function X."
+
+There's also no overlap needed. Overlap in line-based chunking exists to hedge against boundary misses. When chunks are function-sized, there are no boundary misses — the chunk starts at the function declaration and ends at the closing brace.
+
+---
+
+## What this doesn't fix
+
+Three things the function extractor doesn't handle:
+
+**Class methods.** If a function is defined inside a class:
+
+```javascript
+class ImageProcessor {
+  async move(bucket, obj) { ... }
+}
+```
+
+The extractor won't find `move` — the pattern matches top-level declarations only. AllInterviews doesn't use classes extensively in the backend, so this isn't a real gap here. A production extractor would need to handle it.
+
+**Arrow function assignments.**
+
+```javascript
+const processImage = async (config) => {
+  ...
+};
+```
+
+Not matched by the current pattern. Again, the AllInterviews backend uses function declarations almost exclusively at the top level.
+
+**The vocabulary gap.** Still unfixed. `S3 NoSuchKey` still returns nothing. That requires richer indexed text — Part 4.
+
+---
+
+## Summary
+
+| | Line-based | Function-based |
+|---|---|---|
+| Chunks from image.js | 26 | 35 |
+| Chunk size | fixed 50 lines | variable (5–76 lines) |
+| Function name query rank | 1 | 1 |
+| Function name query score | 0.5596 | **0.7093** (+0.15) |
+| Natural language query rank | 3 | **1** |
+| API call query rank | 4 | **2** |
+| Incident vocabulary query | not found | not found (unchanged) |
+
+The chunking split is fixed. The vocabulary gap is Part 4.
+
+---
+
+*Next: Part 4 — closing the vocabulary gap with LLM-generated function summaries: one embedding call per function at index time, indexed text that spans both source vocabulary and error vocabulary.*

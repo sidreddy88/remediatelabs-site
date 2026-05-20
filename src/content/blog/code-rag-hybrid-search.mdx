@@ -1,0 +1,192 @@
+---
+title: "Hybrid Search — Closing the Vocabulary Gap"
+tagline: "The error query went from rank 7 to rank 3. The lexical bonus is 0.24 — larger than the 0.20 vector contribution. For this query, lexical search is doing most of the work."
+date: 2026-06-18
+tags: ["rag", "architecture", "debugging"]
+readTime: 8
+series: "Code RAG in Production"
+seriesPart: 5
+seeAlso: ["code-rag-vocabulary-gap", "rag-hybrid-search"]
+---
+
+*Part 5 of the Code RAG series. Part 4 made the vocabulary gap query visible at rank 7 by appending LLM-generated descriptions to each function chunk. This post applies hybrid search — the same technique used in the Incident RAG series — to push the target function from rank 7 into the top 3.*
+
+---
+
+## Where we left off
+
+After four parts, the progression for `moveAndRemoveFileFromS3`:
+
+```
+Query: "S3 NoSuchKey missing key error"
+
+Part 2 (line-based):           not found
+Part 3 (function-boundary):    not found
+Part 4 (enriched descriptions): rank 7, score 0.28
+```
+
+Part 4 was a breakthrough: the function appeared for the first time. The LLM-generated description appended to the chunk contains "NoSuchKey," so the embedding now has signal in the right direction.
+
+But rank 7 is below the top-3 cutoff — the LLM still wouldn't see this chunk. The problem is that vector similarity of 0.28 isn't enough. The query is about an error event; the chunk is about a function's behaviour. Related, but not close in embedding space.
+
+The insight: "NoSuchKey" now appears literally in the chunk text. Vector search is blind to exact token presence — it measures geometric proximity, not word overlap. Lexical search is the opposite: it rewards exact matches regardless of semantic meaning.
+
+---
+
+## The hybrid formula
+
+Same as Incident RAG Part 5:
+
+```
+hybrid_score = alpha × vector_score + (1 - alpha) × lexical_score
+```
+
+Where:
+- `vector_score` — cosine similarity from the embedding search
+- `lexical_score` — fraction of query tokens found in the document text
+- `alpha = 0.7` — semantic is primary, lexical is a tiebreaker
+
+For the query "S3 NoSuchKey missing key error":
+
+```
+query tokens = {"s3", "nosuchkey", "missing", "key", "error"}   — 5 tokens
+```
+
+The enriched `moveAndRemoveFileFromS3` chunk contains:
+- `"s3"` ✓ (appears in code and description)
+- `"nosuchkey"` ✓ (in the appended description)
+- `"missing"` — not in the chunk text
+- `"key"` ✓ (appears as `Key:` in the S3 params)
+- `"error"` ✓ (appears in the catch block)
+
+4 of 5 tokens matched → lexical_score = 0.80
+
+```
+hybrid = 0.7 × 0.2824 + 0.3 × 0.80
+       = 0.1977 + 0.2400
+       = 0.4377
+```
+
+The 0.24 lexical bonus is larger than the 0.20 vector contribution. For this query, lexical search is doing most of the work — and correctly so. The exact token match on "NoSuchKey" is the right signal.
+
+---
+
+## The results
+
+Four-way comparison across all queries:
+
+```
+Query                               Line      Fn-bndry  Enriched  Hybrid
+------------------------------------------------------------------------
+moveAndRemoveFileFromS3             r1 0.560  r1 0.709  r1 0.675  r1 0.772
+copy S3 object then delete source   r3 0.503  r1 0.572  r1 0.572  r1 0.700
+S3 copyObject deleteObject bucket   r4 0.502  r2 0.597  r2 0.614  r1 0.730
+S3 NoSuchKey missing key error      –  –      –  –      r7 0.282  r3 0.438
+```
+
+All four queries now return the correct function in the top 3. The vocabulary gap query went from completely absent to rank 3.
+
+---
+
+## Breaking down each result
+
+**Query 1: function name — r1, score 0.772**
+
+The function name `moveAndRemoveFileFromS3` appears as a complete token in the chunk. Lexical score is high (it's in the document), and vector score is already strong. Hybrid amplifies an already-good result.
+
+**Query 2: natural language — rank 1, score 0.700**
+
+Already rank 1 after Part 3. "copy," "S3," "object," "source" all appear in the chunk. Lexical adds a +0.18 boost on top of a vector score that was already correct.
+
+**Query 3: API call names — rank 1, score 0.730**
+
+Jumps from rank 2 to rank 1. "copyObject" and "deleteObject" appear verbatim in the code. "bucket" and "key" appear as parameter names. Strong lexical match. This query was about exact API names — exactly what lexical excels at.
+
+**Query 4: incident vocabulary — rank 3, score 0.438**
+
+The key result. "NoSuchKey" is in the chunk (from the description). 4 of 5 query tokens match. The 0.24 lexical bonus pushed the function from rank 7 to rank 3 — exactly at the top-3 cutoff.
+
+---
+
+## Why rank 3, not rank 1?
+
+The top 5 results for the vocabulary gap query:
+
+```
+rank 1  hybrid=0.4602  vec=0.3146  lex=0.80  UploadOriginaltoS3
+        "Generates a signed S3 URL, fetches the image via HTTP, and uploads the
+         buffer to S3 using..."
+
+rank 2  hybrid=0.4526  vec=0.3037  lex=0.80  getImagesDimensions
+        "Fetches images from AWS S3 using getObject, extracts dimensions via sharp
+         metadata, and..."
+
+rank 3  hybrid=0.4377  vec=0.2824  lex=0.80  moveAndRemoveFileFromS3 ◀ TARGET
+        "Copies an S3 object to a new location using AWS S3 API, then deletes the
+         original, handling NoSuchKey..."
+
+rank 4  hybrid=0.4376  vec=0.2823  lex=0.80  fixFailedCompressedImages
+rank 5  hybrid=0.4373  vec=0.2818  lex=0.80  generateThumbnailAndUploadtoS3
+```
+
+All top-5 results have the same lexical score: 0.80 (4 of 5 query tokens matched). Every S3 function in the file contains "s3", "key", and "error" — they all hit the same lexical tier.
+
+The tie-breaker is vector score. `UploadOriginaltoS3` (0.3146) and `getImagesDimensions` (0.3037) have higher vector scores than `moveAndRemoveFileFromS3` (0.2824). Those functions' descriptions happened to be semantically closer to "S3 NoSuchKey missing key error" in embedding space.
+
+The gap between rank 1 and rank 3 is tiny: 0.4602 vs 0.4377, a difference of 0.022. Three functions are essentially tied on the vocabulary gap query. This is the right behaviour — "S3 NoSuchKey missing key error" is a general S3 error query and multiple S3 functions are plausible answers. The correct one is in the top 3.
+
+---
+
+## The complete journey
+
+```
+                    Line    Fn-bndry  Enriched  Hybrid
+──────────────────────────────────────────────────────
+function name       r1 .56  r1 .709   r1 .675   r1 .772
+natural language    r3 .50  r1 .572   r1 .572   r1 .700
+API call names      r4 .50  r2 .597   r2 .614   r1 .730
+NoSuchKey error     –       –         r7 .282   r3 .438
+```
+
+Four steps, each fixing something different:
+
+**Part 2 (baseline measurement):** Found two distinct failure modes — dilution from poor chunking, and absence from vocabulary gap.
+
+**Part 3 (function-boundary chunks):** Fixed dilution. Score for the function name query jumped from 0.56 to 0.71. Natural language query went from rank 3 to rank 1. The fix was structural — isolate each function so the embedding is undiluted.
+
+**Part 4 (LLM descriptions):** Made the vocabulary gap query visible for the first time — rank 7, score 0.28. Added the missing vocabulary (`NoSuchKey`) by generating a description that includes the errors the function can throw.
+
+**Part 5 (hybrid search):** Pushed rank 7 → rank 3 by adding a lexical bonus. Lexical rewards exact token presence. Since "NoSuchKey" is now literally in the chunk, the lexical score is 0.80, pushing the hybrid score well above the noise floor.
+
+---
+
+## What hybrid search does that vector alone can't
+
+Vector search measures semantic proximity in embedding space. Two phrases are close if they carry similar meaning across the embedding model's training distribution.
+
+"S3 NoSuchKey missing key error" and "copies an S3 object, handling NoSuchKey errors" are semantically related — both are about an S3 error condition. But they're not identical concepts. The query is asking about an incident; the description is about a function's behaviour. They land in nearby but not overlapping regions of embedding space, giving a vector score of 0.28.
+
+Lexical search doesn't care about meaning. It checks: is the token "nosuchkey" present in the document? Yes → full credit for that token. It doesn't matter that "handling NoSuchKey errors" and "NoSuchKey missing key error" are phrased differently. The token is there, it matches, score increases.
+
+The hybrid formula combines both:
+- Vector score captures semantic relationships that lexical misses (synonyms, paraphrases)
+- Lexical score captures exact token presence that vector underweights (identifiers, error codes)
+
+For code search, lexical is especially valuable because code has many exact identifiers — function names, error codes, API method names — that appear verbatim in both queries and documents.
+
+---
+
+## Why alpha = 0.7 works here
+
+With alpha = 0.7:
+- A document with a perfect vector score (1.0) and no lexical match scores 0.70
+- A document with a zero vector score and perfect lexical match scores 0.30
+- `moveAndRemoveFileFromS3` with vector=0.28 and lexical=0.80 scores 0.44
+
+The lexical bonus (0.24) is significant but doesn't override a strong vector signal. If a document has vector=0.71 and lexical=0.0, it scores 0.497 — still beats the `NoSuchKey` function (0.438). Semantic relevance is the primary signal; lexical is the tiebreaker.
+
+For queries that are purely natural language with no identifiers, lexical adds noise (all documents have some token overlap). For queries with identifiers or error codes, lexical is a precise signal. The 0.7/0.3 split is conservative — semantic still dominates.
+
+---
+
+*Next: Part 6 — cross-encoder re-ranking for code search: applying the two-stage retrieval architecture to push from top-3 to rank 1 on the hardest queries.*

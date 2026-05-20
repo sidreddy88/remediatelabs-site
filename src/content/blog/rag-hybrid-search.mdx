@@ -1,0 +1,238 @@
+---
+title: "Why Pure Vector Search Fails on Function Names (and How to Fix It)"
+tagline: "A document containing the exact query string verbatim scored 0.24. The wrong incident ranked above it. Here's the fundamental reason vector retrieval fails on identifiers — and how hybrid search fixes it."
+date: 2026-05-08
+tags: ["rag", "architecture", "debugging"]
+readTime: 8
+series: "Incident RAG in Production"
+seriesPart: 5
+seeAlso: ["rag-recall-eval-harness", "rag-cross-encoder-reranking"]
+---
+
+*Part 5 of a series on building and debugging RAG systems on a real production codebase. Earlier posts fixed boilerplate dominance, a deduplication bug, and built a recall@3 eval harness. This post is about a fundamental limitation of vector retrieval: exact identifier matches — and how hybrid search recovers the recall that pure vector retrieval loses.*
+
+---
+
+## The failure I found
+
+My incident corpus contains a SYNTAXERROR incident. Here is its indexed text:
+
+```
+SYNTAXERROR: Failed to parse model JSON: SyntaxError: Unexpected token \ in JSON at position 559
+    at JSON.parse (<anonymous>)
+    at classifyFields (/app/constants/prankCheckerOpenAI.js:251:27)
+    at process.processTicksAndRejections (node:internal/process/task_queues:95:5)
+    at async runPrankChecker (/app/...
+| Root cause: The openai.chat.completions.create() call in classifyFields() is missing
+response_format: { type: 'json_object' }...
+```
+
+The function name `classifyFields` appears twice in this document — once in the stack trace and once in the root cause. A developer who knows "the bug is somewhere in classifyFields" should be able to query for that and get this incident back.
+
+Here's what actually happened:
+
+```
+Query: "classifyFields"
+  Vector score:  0.2355  →  TYPEERROR (wrong incident at rank 1)
+  Correct SYNTAXERROR incident:  rank 2
+```
+
+A document containing the exact query string verbatim scored 0.24. The wrong incident ranked above it. The developer would get the wrong context for their diagnosis.
+
+---
+
+## Why vector retrieval fails on exact identifiers
+
+To understand the failure, you need to understand what the embedding model actually does with a single-word query.
+
+When you embed a full sentence like "SyntaxError unexpected token JSON parse openai response", the model has rich context. It sees: error type, data format, an external API. The resulting vector lands in a region of embedding space that has clear semantic content — near other strings about JSON parsing, API responses, and parse failures.
+
+When you embed a single identifier like `classifyFields`, the model has almost nothing to work with. It sees one word. That word has no inherent meaning in isolation — it's a camelCase JavaScript identifier. The embedding model was trained on natural language. It has no idea what `classifyFields` classifies, where it's called from, or what it does. The resulting vector is a weak, low-confidence point somewhere in the "JavaScript function" neighborhood of embedding space.
+
+Now the model tries to find the closest indexed documents to that weak vector. The SYNTAXERROR document has a strong vector because it contains rich context — error messages, stack frames, root cause prose. But its vector is pulled by all that rich context into a region that doesn't necessarily overlap with the vague "JavaScript function" region that `classifyFields` alone maps to.
+
+The result: the document that contains `classifyFields` verbatim might not rank first for a query of `classifyFields`. The embedding averages all tokens — a single identifier gets diluted by surrounding context.
+
+This isn't a bug in the embedding model. It's a fundamental property of how semantic similarity works. Embedding similarity measures conceptual overlap across the whole string, not exact token presence.
+
+---
+
+## Measuring the damage
+
+I tested four exact identifier queries against the incident corpus:
+
+```
+Query: "classifyFields"            → vector rank 2, score 0.21  (SYNTAXERROR should be rank 1)
+Query: "runPrankChecker"           → vector rank 2, score 0.32  (SYNTAXERROR should be rank 1)
+Query: "checkPrankForInterview"    → vector rank 1, score 0.42  (correct, but barely)
+Query: "publish_decision"          → vector rank 1, score 0.36  (correct, but low confidence)
+```
+
+Two of four queries put the wrong incident first. The other two got it right but with scores of 0.36–0.42 — uncomfortably close to the minimum threshold. A slight change in the corpus could push them below.
+
+The interesting case is `classifyFields` vs `runPrankChecker`. Both appear in the SYNTAXERROR document. `runPrankChecker` scored higher (0.32 vs 0.21) because it appears in the root cause prose — "...at async runPrankChecker" — where it has more surrounding context. `classifyFields` appears in the stack trace, which is dense with tokens but less semantically meaningful. The embedding gives it less weight.
+
+---
+
+## The fix: hybrid score
+
+The insight is simple: vector retrieval is good at semantic similarity but blind to exact token presence. Lexical search is the opposite — it finds exact tokens but ignores meaning.
+
+Combining them gives you both:
+
+```
+hybrid_score = α × vector_score + (1 - α) × lexical_score
+```
+
+Where:
+- `vector_score` is the cosine similarity from the embedding search
+- `lexical_score` is the fraction of query tokens found in the document text
+- `α` controls the trade-off — how much to trust semantic vs lexical
+
+With α = 0.7:
+- Semantic retrieval is the primary signal (70%)
+- Lexical match is a tiebreaker (30%)
+
+A document that matches semantically AND contains the exact query tokens scores higher than one that only matches semantically. A document with a terrible vector score but a perfect lexical match gets a meaningful boost.
+
+---
+
+## Computing lexical score
+
+Lexical score in my implementation is simple token overlap:
+
+```python
+query_tokens = set(query.lower().split())
+doc_lower = m.document.lower()
+matched = sum(1 for t in query_tokens if t in doc_lower)
+lexical_score = matched / len(query_tokens) if query_tokens else 0.0
+```
+
+For query `"classifyFields"`:
+- `query_tokens = {"classifyfields"}` (lowercased)
+- SYNTAXERROR doc: `"classifyfields"` appears → matched = 1 → lexical_score = 1.0
+- TYPEERROR doc: `"classifyfields"` not present → matched = 0 → lexical_score = 0.0
+
+For a multi-word query like `"S3 NoSuchKey missing key"`:
+- `query_tokens = {"s3", "nosuchkey", "missing", "key"}` — 4 tokens
+- A document containing 3 of them scores lexical_score = 0.75
+- The lexical score scales with how many query terms appear, not just whether any appear
+
+This is simple, fast, and requires no additional dependencies. More sophisticated approaches (BM25, TF-IDF) would give better results for longer queries, but for the exact-identifier case, token presence is the right signal.
+
+---
+
+## Walking through the math
+
+Let me show the exact calculation for `classifyFields` to make it concrete.
+
+Vector scores from the embedding search:
+
+```
+TYPEERROR:   0.235   (ranked 1st by pure vector)
+SYNTAXERROR: 0.206   (ranked 2nd by pure vector)
+```
+
+Lexical scores:
+
+```
+SYNTAXERROR: classifyFields appears in doc → lexical = 1.0
+TYPEERROR:   classifyFields not in doc     → lexical = 0.0
+```
+
+Hybrid scores (α = 0.7):
+
+```
+TYPEERROR:   0.7 × 0.235 + 0.3 × 0.0 = 0.1645 + 0.000 = 0.1645
+SYNTAXERROR: 0.7 × 0.206 + 0.3 × 1.0 = 0.1442 + 0.300 = 0.4442
+```
+
+SYNTAXERROR jumps from rank 2 to rank 1. The lexical bonus of 0.30 far outweighs the vector score difference of 0.029. The exact match signal dominates correctly.
+
+---
+
+## The implementation
+
+```python
+async def hybrid_search_incidents(
+    self,
+    query: str,
+    n_results: int = 3,
+    alpha: float = 0.7,
+) -> list[dict]:
+    embedding = await self._embed([query])
+    # Fetch wide candidate pool — exact-match doc may rank low on vector alone
+    candidates = self._incident_collection.query(
+        embedding[0], n_results=max(n_results * 4, 20)
+    )
+    if not candidates:
+        return []
+
+    query_tokens = set(query.lower().split())
+    results = []
+    for m in candidates:
+        doc_lower = m.document.lower()
+        matched = sum(1 for t in query_tokens if t in doc_lower)
+        lexical = matched / len(query_tokens) if query_tokens else 0.0
+        hybrid = alpha * m.score + (1 - alpha) * lexical
+        results.append({
+            "incident_id":    m.metadata.get("incident_id", m.id),
+            "text":           m.document,
+            "score":          round(hybrid, 4),
+            "vector_score":   round(m.score, 4),
+            "lexical_score":  round(lexical, 4),
+            "status":         m.metadata.get("status", ""),
+            "pr_url":         m.metadata.get("pr_url", ""),
+            "fix_description": m.metadata.get("fix_description", ""),
+        })
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results[:n_results]
+```
+
+Four design decisions worth explaining.
+
+**Fetch a wider candidate set first.** Pure vector retrieval at `n_results=3` might not include the exact-match document at all if it scores low. The hybrid function fetches `max(n_results × 4, 20)` candidates at `min_score=0.0`, then re-ranks them all. This is necessary because the document you need might be at vector rank 8. If you only fetch the top 3 from vector search, you never see it — there's nothing for the lexical score to rescue.
+
+**Keep `search_incidents` unchanged.** `hybrid_search_incidents` is a new method, not a replacement. `search_incidents` still exists and is used for the dedup gate. The dedup gate should stay pure vector — it's asking "is this the same bug," which is a semantic question. Exact token presence doesn't help there.
+
+**Return both scores for observability.** The result dict has `score` (hybrid, used for ranking), `vector_score`, and `lexical_score`. Knowing which component drove the result helps debug unexpected rankings. If a result ranked highly but `vector_score` is low, you know it was a lexical rescue.
+
+**Alpha = 0.7 is the starting point, not the answer.** The right alpha depends on your query distribution. If most queries are natural language descriptions, lean higher (0.8–0.9). If many queries are exact identifiers or error codes, lean lower (0.5–0.6). Measure on real query logs before tuning.
+
+---
+
+## Before and after
+
+| Query | Vector rank | Vector score | Hybrid rank | Hybrid score |
+|---|---|---|---|---|
+| classifyFields | 2 | 0.21 | 1 | 0.44 |
+| runPrankChecker | 2 | 0.32 | 1 | 0.52 |
+| checkPrankForInterview | 1 | 0.42 | 1 | 0.60 |
+| publish_decision | 1 | 0.36 | 1 | 0.55 |
+
+Two rank improvements, two score lifts. The queries that were already correct got more confident; the queries that were wrong got fixed.
+
+---
+
+## When hybrid helps and when it doesn't
+
+**Hybrid helps when:**
+- The query is a single identifier: function name, error code, variable name, file path
+- The query is a short phrase where exact wording matters more than semantic meaning
+- The right document exists in the corpus but vector ranked it low because the query lacks context
+
+**Hybrid doesn't help when:**
+- The query is a natural language description: "image upload fails on large files"
+- The right document uses completely different vocabulary from the query (which is exactly where semantic retrieval shines)
+- The corpus doesn't contain the exact tokens — a lexical score of 0.0 doesn't hurt, but it doesn't help either
+
+**Hybrid actively hurts when:**
+- Your query tokens are common across many documents (e.g., "error", "failed", "undefined") — high lexical scores on many documents adds noise rather than signal
+- Alpha is set too low — lexical should be a tiebreaker, not the primary signal, for most natural language queries
+
+The right mental model: semantic search for recall, lexical for precision on identifiers. Together they cover the cases each misses alone.
+
+---
+
+*Next: Part 6 — cross-encoder re-ranking: why two-stage retrieval (vector for recall, cross-encoder for precision) is the right architecture for production RAG.*

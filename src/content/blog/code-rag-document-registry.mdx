@@ -1,0 +1,127 @@
+---
+title: "Document Registry — Keeping the Index Honest"
+tagline: "Upsert is insert-or-update by ID. It doesn't delete old chunks when a function is refactored. Without a registry, stale vectors accumulate silently until your LLM is reading code that was deleted six months ago."
+date: 2026-06-25
+tags: ["rag", "architecture", "debugging"]
+readTime: 6
+series: "Code RAG in Production"
+seriesPart: 6
+seeAlso: ["code-rag-hybrid-search"]
+---
+
+*Part 6 of the Code RAG series. Parts 1–5 built a retrieval pipeline that works. This post fixes the silent failure that accumulates over time: stale vectors from files that changed or were deleted.*
+
+---
+
+## The problem: upsert doesn't mean "replace"
+
+The RAG pipeline from Parts 1–5 uses ChromaDB's upsert to index files. Each chunk gets a stable ID — `sha256("file_path:start_line")[:16]` — so re-running the indexer on an unchanged file is a no-op. Safe.
+
+But upsert is "insert or update by ID." It doesn't know anything about what other chunks existed for the same file previously. Consider what happens when `moveAndRemoveFileFromS3` is refactored from one function into two:
+
+```
+Before:  moveAndRemoveFileFromS3  →  chunk ID a3f2 (lines 479–495)
+After:   moveFile                 →  chunk ID b1c4 (lines 479–487)
+         removeFile               →  chunk ID d9e7 (lines 489–501)
+```
+
+The new chunks `b1c4` and `d9e7` get upserted. But `a3f2` — the old chunk — is never touched. It stays in the collection forever, pointing at code that no longer exists.
+
+Every subsequent search over the codebase will potentially return `a3f2` as a result. The LLM receives a ghost — a chunk describing a function that was deleted six months ago.
+
+---
+
+## The fix: a document registry
+
+The solution is a mapping layer between files (documents) and their current chunk IDs. Before indexing a file, consult the registry. After indexing, update it.
+
+```sql
+CREATE TABLE doc_chunk_registry (
+    doc_id          TEXT NOT NULL,        -- relative file path
+    chunk_vector_id TEXT NOT NULL,        -- chunk_id in the vector store
+    content_hash    TEXT NOT NULL,        -- sha256 of file content
+    collection      TEXT NOT NULL,        -- vector collection name
+    indexed_at      TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'active',  -- active | superseded
+    INDEX idx_dcr_doc_id (doc_id),
+    INDEX idx_dcr_chunk_vector_id (chunk_vector_id)
+);
+```
+
+The re-index flow for a changed file:
+
+```
+1. Hash check   — sha256(new content) == registry hash? → skip
+2. Delete old   — fetch active chunk IDs from registry, delete from vector store
+3. Mark stale   — UPDATE status = 'superseded' WHERE doc_id = X AND status = 'active'
+4. Chunk + embed — produce new chunks, embed, upsert
+5. Register     — INSERT new rows with status = 'active'
+```
+
+Steps 2–5 are not atomic at the database level (the vector store and Postgres are separate systems), but the `status` column provides observability: a row stuck in `'active'` status whose chunk ID no longer exists in the vector store indicates a partial failure.
+
+---
+
+## What this buys you
+
+**Stale chunk elimination.** When a file is refactored, the old chunks are explicitly deleted from the vector store. Searches no longer return results pointing at code that no longer exists.
+
+**Skip-on-unchanged.** The hash check means re-running the indexer on a large codebase is cheap. Only files that actually changed are re-embedded. A 5,000-file repo where 20 files changed in a PR costs 20 embed calls, not 5,000.
+
+**Audit trail.** The `superseded` rows stay in the registry. You can query the history of a file: what chunks existed before the last reindex, when were they replaced.
+
+---
+
+## The hash check in practice
+
+```python
+def _file_changed(self, doc_id: str, content_hash: str) -> bool:
+    row = db.query(
+        "SELECT content_hash FROM doc_chunk_registry "
+        "WHERE doc_id = %s AND status = 'active' LIMIT 1",
+        (doc_id,)
+    )
+    if row is None:
+        return True   # new file
+    return row.content_hash != content_hash
+```
+
+Most "updates" in a codebase are metadata changes — a bumped version string, a reformatted comment — that don't change the embedded content. In practice, hashing eliminates 60–80% of unnecessary embed calls during incremental runs.
+
+---
+
+## Before and after
+
+Before (upsert only):
+
+```
+Index AllInterviews (5,500 chunks, 428 files)
+Re-run after 10-file PR → 5,500 embed calls, 0 deletions
+Stale chunks from deleted functions: accumulate silently
+```
+
+After (registry-backed):
+
+```
+Index AllInterviews (5,500 chunks, 428 files)
+Re-run after 10-file PR → ~80 embed calls (changed files only), correct deletions
+Stale chunks: 0
+```
+
+---
+
+## What this doesn't solve
+
+The registry handles file-level updates correctly. It doesn't solve everything.
+
+**Deleted files.** If a file is removed from the repo, the indexer never visits it, so its chunks are never deleted. Fix: on each full run, compare registry `doc_id` values against the actual file list and delete orphaned entries.
+
+**Renamed files.** A rename looks like a new file + a deleted file. The old `doc_id` accumulates stale chunks until a full-run orphan cleanup. Fix: track git rename events and update the registry accordingly.
+
+**Collection drift.** The `collection` column in the registry tracks which vector collection a chunk lives in. If you switch collections (say, from `codebase` to `codebase_fn`), old entries in the registry point at the wrong collection and the deletions silently no-op. Fix: filter deletes by `collection = self._collection._name`.
+
+These are the edge cases that distinguish a demo index from a production one.
+
+---
+
+*Next: Part 7 — incremental indexing via git diff: instead of re-scanning the full file tree, read `git diff HEAD~1` and update only the files that changed in the last commit.*

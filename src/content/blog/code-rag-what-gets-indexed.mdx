@@ -1,0 +1,238 @@
+---
+title: "What Actually Gets Indexed"
+tagline: "A 1026-line file produces 26 chunks. Most boundaries fall mid-function, with no awareness of code structure. Here's exactly what gets lost — and why it matters for search quality."
+date: 2026-05-21
+tags: ["rag", "architecture", "debugging"]
+readTime: 8
+series: "Code RAG in Production"
+seriesPart: 1
+seeAlso: ["rag-boilerplate-dominance"]
+---
+
+*A new series alongside the Incident RAG posts. Same production codebase — AllInterviews, a Node.js/Express backend with 422 JS/TS files. Different problem: indexing source code for semantic search so agents can find relevant code when diagnosing and fixing bugs.*
+
+---
+
+## Why code RAG is different from incident RAG
+
+The incident RAG series indexed short, dense documents — each one a formatted string like:
+
+```
+S3_NO_SUCH_KEY: S3 throws NoSuchKey on missing key | Root cause: The copyObject call fails when the source key doesn't exist before the move completes
+```
+
+Every document was purpose-built for retrieval. One incident, one text, written in natural language about what went wrong.
+
+Code RAG indexes source files. A source file is not a document — it's hundreds or thousands of lines written for a compiler, not a search engine. Functions share files. Files share modules. A single file can contain ten unrelated functions, a hundred imported names, and boilerplate that's identical across every file in the repo.
+
+You can't index a file as one document. You have to chunk it. And how you chunk it determines everything about what you can find.
+
+---
+
+## How the current chunker works
+
+The chunker in `app/services/rag.py` is simple: split by line count.
+
+```python
+CHUNK_LINES = 50    # target lines per chunk
+OVERLAP_LINES = 10  # lines shared between adjacent chunks
+```
+
+Take a file. Split it into windows of 50 lines. Each window starts 40 lines after the previous one (50 − 10 overlap). So a 1026-line file produces 26 chunks, each sharing 10 lines with its neighbors.
+
+The overlap exists for a specific reason: if a function boundary falls near the end of a chunk, the next chunk will still contain enough of that function's opening lines to be searchable. Without overlap, a 5-line function that starts at line 48 of a 50-line window would appear as 2 lines in one chunk and 3 lines in the next — neither enough to be useful.
+
+The 10-line overlap is a hedge against boundary misses. It's not a guarantee.
+
+---
+
+## What the chunks look like in practice
+
+`routes/services/image.js` is 1026 lines long. The indexer produces 26 chunks. Here's the full list:
+
+```
+chunk  lines    1–  50   const aws = require("aws-sdk");
+chunk  lines   41–  90   [blank — overlap with chunk 1]
+chunk  lines   81– 130   })  [mid-S3 config]
+chunk  lines  121– 170   Key: baseFileKey,
+chunk  lines  161– 210   } else {
+chunk  lines  201– 250   try {
+chunk  lines  241– 290   }
+chunk  lines  281– 330   const compressedKeyIndex = ...
+chunk  lines  321– 370   Bucket: bucket,
+chunk  lines  361– 410   }
+chunk  lines  401– 450   }
+chunk  lines  441– 490   if (payload.keysToAdd) {
+chunk  lines  481– 530   if (!imageObj.source || !imageObj.destination)
+chunk  lines  521– 570   data.append("file", imageBuffer, ...)
+chunk  lines  561– 610   }
+chunk  lines  601– 650   async function s3ObjectExists(s3Client, bucket, key)
+chunk  lines  641– 690   // Delete original image
+chunk  lines  681– 730   } catch (err) {
+chunk  lines  721– 770   await axios.delete(deleteUrl, ...)
+chunk  lines  761– 810   [blank]
+chunk  lines  801– 850   };
+chunk  lines  841– 890   const images = await Promise.allSettled(...)
+chunk  lines  881– 930   let originalImages = ...
+chunk  lines  921– 970   }
+chunk  lines  961–1010   const image = await fetch(...)
+chunk  lines 1001–1026   removeFile,
+```
+
+The first thing to notice: chunk boundaries fall in the middle of function bodies constantly. Lines 81–130 starts with `})` — closing a callback that started before the chunk. Lines 121–170 starts with `Key: baseFileKey,` — the middle of an object literal. Lines 161–210 starts with `} else {` — mid-conditional.
+
+A reader dropped into any of these chunks cold has no idea what function they're in.
+
+---
+
+## A specific case: moveAndRemoveFileFromS3
+
+The function responsible for the S3 NoSuchKey incident:
+
+```javascript
+// line 479
+async function moveAndRemoveFileFromS3(bucket, imageObj) {
+  try {
+    if (!imageObj.source || !imageObj.destination) return;
+    if (imageObj.source === imageObj.destination) return;
+
+    await s3
+      .copyObject({
+        Bucket: bucket,
+        CopySource: `${bucket}/${imageObj.source}`,
+        Key: `${imageObj.destination}`,
+      })
+      .promise();
+    await s3.deleteObject({ Bucket: bucket, Key: imageObj.source }).promise();
+  } catch (error) {
+    console.log("moveAndRemoveFileFromS3 error", error, bucket, imageObj);
+  }
+}
+// ends at line 495
+```
+
+It's 17 lines. The 50-line chunker splits it across two chunks:
+
+**Chunk 441–490** — contains the function declaration at line 479, but the first 38 lines (441–478) are a completely different function. The `moveAndRemoveFileFromS3` body is cut off at line 490, mid-way through the `.copyObject()` call.
+
+**Chunk 481–530** — starts inside the function body at line 481, with the overlap giving it lines 481–490 again. This chunk has the `copyObject`, `deleteObject`, and catch block. But it has no function declaration — a reader (or embedding model) looking at this chunk doesn't know what function they're in.
+
+Here's what each chunk actually looks like when you read them:
+
+**Chunk 441–490:**
+
+```javascript
+// lines 441-478: unrelated function (keysToAdd/keysToRemove logic)
+if (payload.keysToAdd) {
+  for (let i = 0; i < payload.keysToAdd.length; i++) {
+    images.push(payload.keysToAdd[i]);
+    compressAndUploadtoS3(bucket, payload.keysToAdd[i], compressedImageFilePath);
+    compressedImages.push(compressedImageFilePath);
+  }
+}
+...
+function replaceFunc(sourceObjArr, index, destinationObjArr) { ... }
+
+// lines 479-490: start of moveAndRemoveFileFromS3
+async function moveAndRemoveFileFromS3(bucket, imageObj) {
+  try {
+    if (!imageObj.source || !imageObj.destination) return;
+    if (imageObj.source === imageObj.destination) return;
+    await s3
+      .copyObject({
+        Bucket: bucket,
+        CopySource: `${bucket}/${imageObj.source}`,
+        Key: `${imageObj.destination}`,
+      })
+      .promise();   // <-- CUT OFF HERE
+```
+
+**Chunk 481–530:**
+
+```javascript
+// No function declaration — starts inside the body
+    if (!imageObj.source || !imageObj.destination) return;
+    if (imageObj.source === imageObj.destination) return;
+
+    await s3
+      .copyObject({
+        Bucket: bucket,
+        CopySource: `${bucket}/${imageObj.source}`,
+        Key: `${imageObj.destination}`,
+      })
+      .promise();
+    await s3.deleteObject({ Bucket: bucket, Key: imageObj.source }).promise();
+  } catch (error) {
+    console.log("moveAndRemoveFileFromS3 error", error, bucket, imageObj);
+  }
+}
+
+// lines 497-530: next function (slugify)
+function slugify(text) { ... }
+async function uploadImageByConfig(imageUrl, config, ...) { ... }
+```
+
+Neither chunk is self-contained. The first has the function name but not the full body. The second has the full body but no function name.
+
+---
+
+## Why overlap doesn't fully fix this
+
+The 10-line overlap puts lines 481–490 in both chunks. That helps: the second chunk recovers most of the function body even though the declaration is in the first chunk.
+
+But overlap can't fix the dilution problem. The first chunk is 80% unrelated code. Its embedding is pulled toward whatever `keysToAdd`/`keysToRemove` logic is about, not toward S3 copy-and-delete operations. The second chunk has the body but no function name — a query for `moveAndRemoveFileFromS3` finds the first chunk, not the second.
+
+Overlap is a partial fix for the boundary problem. It doesn't help when a short function lands at the end of a chunk with a lot of unrelated context before it.
+
+---
+
+## What a good chunk looks like
+
+For contrast, look at `s3ObjectExists` — it starts at line 601, well within the 601–650 chunk:
+
+```javascript
+async function s3ObjectExists(s3Client, bucket, key) {
+  try {
+    await s3Client.headObject({ Bucket: bucket, Key: key }).promise();
+    return true;
+  } catch (err) {
+    if (err.code === 'NotFound') {
+      return false;
+    }
+    throw err;
+  }
+}
+```
+
+This function is 12 lines, starts 1 line into the chunk, and is followed by the start of `deleteImageVariantsFromS3`. The chunk has the complete function with its declaration and is easy to understand without surrounding context.
+
+Queries for S3 key existence, `headObject`, `NotFound` — they all land here cleanly.
+
+The difference between `s3ObjectExists` (easy to find) and `moveAndRemoveFileFromS3` (hard to find) isn't about what the functions do. It's about where their declarations happen to fall relative to a 50-line window.
+
+---
+
+## The structural problem
+
+Fixed line-count chunking is unaware of code structure. It doesn't know what a function is. It doesn't know where one ends and another begins. It slices the file into equal-size strips and embeds whatever falls in each strip.
+
+This works reasonably well for large functions — a 100-line function will dominate at least one chunk, and that chunk will have a coherent semantic identity. It breaks down for small functions (under 50 lines) that share a chunk with neighbors, especially when the function boundary doesn't align with the chunk boundary.
+
+`routes/services/image.js` is 1026 lines with many small utility functions. The file is a collection of tightly scoped helpers. The 50-line chunker is a poor fit for it.
+
+Part 2 measures exactly how much this costs in search quality.
+
+---
+
+## Key takeaways
+
+- 26 chunks for a 1026-line file — one chunk every ~40 lines
+- Most chunk boundaries fall mid-function, with no awareness of code structure
+- 10-line overlap reduces but doesn't eliminate the boundary problem
+- Short functions that land near the end of a chunk are the worst case
+- Functions that start near the beginning of a chunk are fine
+- The fix is function-boundary chunking — one chunk per function, sized to the function, not to an arbitrary line count
+
+---
+
+*Next: Part 2 — measuring the retrieval cost of line-count chunking with a concrete eval suite, before touching the chunker.*
