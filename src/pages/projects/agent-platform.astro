@@ -79,8 +79,8 @@ const agents = [
       A 5-agent pipeline that detects production crashes, grounds the diagnosis against the actual
       repo, generates a patch, validates it in a Docker sandbox, and opens a PR — fully automated
       for LOW/MEDIUM severity, with a human approval gate for anything HIGH/CRITICAL. Designed
-      around three constraints: zero polling load on production, no fabricated symbols in fixes,
-      and an approval gate before any destructive change.
+      around two constraints: zero polling load on production and an approval gate before any
+      destructive change.
     </p>
     <div class="flex flex-col sm:flex-row gap-3 mt-8">
       <DemoCTA />
