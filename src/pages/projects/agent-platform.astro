@@ -99,7 +99,7 @@ const agents = [
     <p class="text-muted mb-2">Every production error flows through this graph. Sandbox failure regenerates the fix up to 3× before any GitHub noise. HIGH/CRITICAL incidents stop at the approval gate.</p>
     <Mermaid
       chart={pipelineChart}
-      caption="End-to-end pipeline — from CloudWatch alarm to merged fix PR."
+      caption="End-to-end pipeline — from detected event to merged fix PR."
     />
   </section>
 
@@ -131,26 +131,27 @@ const agents = [
     <h2 class="text-2xl font-semibold tracking-tight text-ink mb-6">How the metrics are computed</h2>
     <ul class="space-y-4 text-muted leading-relaxed">
       <li>
-        <strong class="text-ink">Time-to-first-PR</strong> — wall-clock from CloudWatch alarm
-        webhook receipt to GitHub PR creation. Decomposed in
-        <code class="text-accent">scripts/measure_mttr.py</code> into
-        agent-bound (LLM + tool latency) vs human-bound (approval queue) so the agent number is
-        attributable.
+        <strong class="text-ink">Agent pipeline</strong> — wall-clock from detected event to
+        GitHub PR creation. Measured by <code class="text-accent">scripts/measure_mttr.py</code>
+        against the live demo DB. Covers triage → diagnosis → fix generation → sandbox → PR open;
+        excludes human review and CI time.
       </li>
       <li>
-        <strong class="text-ink">Triage accuracy</strong> — TriageAgent run against
-        <code class="text-accent">app/evals/golden_dataset.jsonl</code> (100+ labelled cases:
-        real/noise/duplicate × P0–P3). Eval runner isolates the agent from live AWS via stubs.
+        <strong class="text-ink">CI pass rate</strong> — fraction of generated patches that pass
+        the Docker sandbox test suite on the first run. The sandbox clones the target repo, runs a
+        baseline (pre-patch), applies the fix, and only fails the run if the fix introduces new
+        test failures beyond the baseline.
       </li>
       <li>
-        <strong class="text-ink">False-positive rate</strong> — fraction of incoming events
-        classified as real that turned out to be noise on human review. Captured into the
-        golden dataset so the next eval has a higher bar.
+        <strong class="text-ink">Avg confidence</strong> — mean diagnosis confidence score
+        returned by DiagnosisAgent across resolved incidents. Scores below 0.70 route to human
+        review instead of automatic fix generation.
       </li>
       <li>
-        <strong class="text-ink">Sample size</strong> — production incidents in
-        <code class="text-accent">agent_platform.db</code> from the live deploy. Refreshed
-        whenever <code class="text-accent">measure_mttr.py</code> is re-run.
+        <strong class="text-ink">Cost per run</strong> — total LLM spend per end-to-end pipeline
+        run (triage + diagnosis + fix generation + code review), measured from
+        <code class="text-accent">config/llm_routing.json</code> token pricing. Haiku for triage
+        keeps per-event cost low; Sonnet for diagnosis and fix is the main driver.
       </li>
     </ul>
   </section>
