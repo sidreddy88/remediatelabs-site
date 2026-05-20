@@ -76,10 +76,11 @@ const agents = [
       agent-platform
     </h1>
     <p class="text-muted text-lg mt-4 max-w-3xl leading-relaxed">
-      A 5-agent pipeline that detects production errors, grounds the diagnosis against the actual
-      repo, generates a patch, validates it in a Docker sandbox, and opens a PR — all before
-      anyone gets paged. Designed around three constraints: zero polling load on production,
-      no fabricated symbols in fixes, and human approval for anything HIGH/CRITICAL.
+      A 5-agent pipeline that detects production crashes, grounds the diagnosis against the actual
+      repo, generates a patch, validates it in a Docker sandbox, and opens a PR — fully automated
+      for LOW/MEDIUM severity, with a human approval gate for anything HIGH/CRITICAL. Designed
+      around three constraints: zero polling load on production, no fabricated symbols in fixes,
+      and an approval gate before any destructive change.
     </p>
     <div class="flex flex-col sm:flex-row gap-3 mt-8">
       <DemoCTA />
@@ -143,15 +144,10 @@ const agents = [
         test failures beyond the baseline.
       </li>
       <li>
-        <strong class="text-ink">Avg confidence</strong> — mean diagnosis confidence score
-        returned by DiagnosisAgent across resolved incidents. Scores below 0.70 route to human
-        review instead of automatic fix generation.
-      </li>
-      <li>
-        <strong class="text-ink">Cost per run</strong> — total LLM spend per end-to-end pipeline
-        run (triage + diagnosis + fix generation + code review), measured from
-        <code class="text-accent">config/llm_routing.json</code> token pricing. Haiku for triage
-        keeps per-event cost low; Sonnet for diagnosis and fix is the main driver.
+        <strong class="text-ink">Avg MTTR</strong> — wall-clock from detected event to merged fix
+        PR, including human review and CI time. Measured across resolved incidents in the live demo
+        DB. The ~6 min agent pipeline is the automated portion; the remainder is async human
+        approval and CI.
       </li>
     </ul>
   </section>
