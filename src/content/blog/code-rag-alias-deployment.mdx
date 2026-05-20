@@ -1,0 +1,214 @@
+---
+title: "Alias-Based Deployment — Zero-Downtime Index Rebuilds"
+tagline: "Without an alias swap, a full rebuild puts your index in a broken state for its entire duration. Queries return a mix of old and new results that never existed as a coherent snapshot."
+date: 2026-07-09
+tags: ["rag", "architecture", "debugging"]
+readTime: 8
+series: "Code RAG in Production"
+seriesPart: 8
+seeAlso: ["code-rag-rechunk-reindex-reembed", "code-rag-document-registry"]
+---
+
+*Part 8 of the Code RAG series. Parts 1–7 built a RAG pipeline that indexes correctly and stays fresh. This post covers the one operational problem that none of that solves: what happens to live queries while you're rebuilding the index.*
+
+---
+
+## The problem: partial indexes
+
+A full index rebuild takes time. For the AllInterviews codebase (5,500 chunks, 428 files), it takes a few minutes. For a large enterprise codebase (500k chunks), it could take hours.
+
+During that rebuild, your system is in a broken state you can't see from the outside.
+
+Here's the timeline without alias-based deployment:
+
+```
+t=0     Rebuild starts. Old index has 5,500 chunks.
+t=1min  2,000 new chunks inserted. Old chunks not deleted yet.
+        Index now has 7,500 chunks: 2,000 new + 5,500 old.
+        Queries return a mix of old and new results.
+t=3min  All new chunks inserted. Old chunks being deleted.
+        Index now has 6,000 chunks: 5,500 new + 500 stale.
+t=5min  Rebuild complete. Index has 5,500 new chunks.
+```
+
+Between t=0 and t=5, every query hits a "Frankenstein index" — some results from the new version, some from the old, some from a transition state that never existed as a coherent snapshot.
+
+If the rebuild was triggered by a chunking strategy change (Part 7), the transition state is especially bad: search results contain a mix of line-based chunks and function-boundary chunks with different embedding geometries, producing incoherent scores.
+
+If the rebuild failed halfway, the index is permanently corrupted until someone notices and manually intervenes.
+
+---
+
+## The solution: build in shadow, swap atomically
+
+The core idea: never touch the live index during a rebuild. Build the new index in a separate collection. Validate it. Then swap a pointer.
+
+```
+Live:    collection "codebase_v1"  ← all queries hit this
+Shadow:  collection "codebase_v2"  ← rebuild happens here, invisible to queries
+
+Rebuild completes on codebase_v2.
+Validate codebase_v2 against benchmark queries.
+Swap: "codebase_current" pointer → codebase_v2.
+
+Old:     collection "codebase_v1"  ← kept warm for rollback window
+Live:    collection "codebase_v2"  ← all queries now hit this
+```
+
+Queries never see a partial index. From their perspective, the collection name they query (`"codebase_current"`) never changes. What's behind that name is swapped atomically.
+
+This is the same pattern Elasticsearch calls "index aliasing" and databases call "blue-green deployment." The RAG version is simpler because you're swapping a config value, not routing network traffic.
+
+---
+
+## When you need it
+
+Not every index operation needs alias-based deployment. The document registry from Part 6 handles incremental updates safely — hash check, delete old chunks, insert new ones. That's safe to run on the live index because it touches one file at a time.
+
+Alias-based deployment is needed when you're doing a full rebuild — when the entire index becomes temporarily inconsistent:
+
+| Operation | Safe on live index? | Needs alias swap? |
+|---|---|---|
+| One file changed (hash miss) | Yes — atomic per file | No |
+| File deleted | Yes — delete a few rows | No |
+| New file added | Yes — insert new rows | No |
+| Chunking strategy changed | No — all chunks change at once | Yes |
+| Embedding model changed | No — all vectors change at once | Yes |
+| Bulk re-index after long outage | No — many files change at once | Yes |
+
+The rule: if more than one file is changing at the same time, consider the alias pattern. If the entire corpus is changing, always use it.
+
+---
+
+## Implementation
+
+**Step 1: version your collection names**
+
+Instead of a hardcoded `COLLECTION_NAME = "codebase"`, use a versioned name and a pointer:
+
+```python
+# In config
+COLLECTION_NAME = "codebase"          # the live alias — what queries use
+COLLECTION_VERSION = "v1"             # what's currently behind the alias
+
+# Actual collection name in ChromaDB / pgvector:
+# "codebase_v1"
+```
+
+In the `RAGService`, queries always use the alias:
+
+```python
+self._collection = make_collection(f"{COLLECTION_NAME}_{COLLECTION_VERSION}")
+```
+
+**Step 2: build the shadow index**
+
+When a full rebuild is needed, create a new versioned collection and index into it:
+
+```python
+async def rebuild_index(path: str) -> str:
+    new_version = f"v{int(time.time())}"
+    shadow_name = f"codebase_{new_version}"
+
+    # Build into shadow — live queries still hit codebase_v1
+    shadow_rag = RAGService(collection_name=shadow_name)
+    n = await shadow_rag.index_directory(path)
+    print(f"Shadow index built: {n} chunks in {shadow_name}")
+
+    return new_version
+```
+
+**Step 3: validate before swapping**
+
+Never swap without validating. The whole point of the shadow index is that you can check it before it goes live.
+
+```python
+async def validate_index(version: str) -> bool:
+    rag = RAGService(collection_name=f"codebase_{version}")
+
+    benchmarks = [
+        ("moveAndRemoveFileFromS3", "moveAndRemoveFileFromS3", 0.70),
+        ("copy S3 object then delete source", "moveAndRemoveFileFromS3", 0.55),
+        ("S3 NoSuchKey missing key error", "moveAndRemoveFileFromS3", 0.35),
+    ]
+
+    for query, expected_fn, min_score in benchmarks:
+        results = await rag.search(query, n_results=3)
+        top = results[0] if results else None
+        if not top or top.score < min_score:
+            print(f"FAIL: '{query}' → got {top.score:.3f}, wanted ≥{min_score}")
+            return False
+        print(f"PASS: '{query}' → {top.score:.3f} ≥ {min_score}")
+
+    return True
+```
+
+If validation fails, the shadow index is discarded. The live index is untouched. No user saw a bad result.
+
+**Step 4: swap atomically**
+
+```python
+async def swap_index(new_version: str) -> None:
+    # In production: update a config value in AWS SSM Parameter Store
+    # or update a "current_version" row in Postgres
+    settings.collection_version = new_version
+    print(f"Swapped: codebase_current → codebase_{new_version}")
+```
+
+In practice, "atomic swap" means updating a single config value that all new requests will read. Requests already in-flight continue using the old collection until they complete. The transition is seamless.
+
+**Step 5: keep the old index for rollback**
+
+Don't delete the old collection immediately. Keep it for a rollback window — typically 24–48 hours:
+
+```python
+async def cleanup_old_index(old_version: str, retain_hours: int = 24) -> None:
+    scheduled_at = datetime.utcnow() + timedelta(hours=retain_hours)
+    print(f"Old index codebase_{old_version} scheduled for deletion at {scheduled_at}")
+```
+
+If answer quality drops after the swap — which you catch with the eval harness — you can roll back by pointing the alias at the old version. Without the old collection, rollback means a full rebuild under pressure.
+
+---
+
+## What "atomic" actually means here
+
+The swap is not transactionally atomic in the database sense. You cannot update the config value and guarantee that zero requests see the transition. What you can guarantee is:
+- Every request that starts **after** the swap uses the new collection
+- Every request that started **before** the swap uses the old collection
+- No request ever sees a partial collection
+
+This is "atomic" in the operational sense: there is no window during which the collection is partially rebuilt. The collection is either fully old or fully new. The transition happens at a single point in time (the config update), not over the duration of a rebuild.
+
+Contrast this with rebuilding in-place: the transition window is the entire rebuild duration — minutes to hours — during which every query sees an inconsistent mix.
+
+---
+
+## The full rebuild script
+
+```python
+async def full_rebuild(path: str) -> bool:
+    print("Step 1: Building shadow index...")
+    new_version = await rebuild_index(path)
+
+    print("Step 2: Validating shadow index...")
+    if not await validate_index(new_version):
+        print("Validation failed — keeping live index unchanged")
+        return False
+
+    print("Step 3: Swapping alias...")
+    old_version = settings.collection_version
+    await swap_index(new_version)
+
+    print("Step 4: Scheduling old index cleanup...")
+    await cleanup_old_index(old_version, retain_hours=24)
+
+    print(f"Done. Live index is now codebase_{new_version}")
+    return True
+```
+
+Run this whenever a chunking strategy or embedding model change is deployed. Incremental file updates continue to use the document registry pattern from Part 6 — they don't need the alias swap.
+
+---
+
+*Next: Part 9 — incremental indexing via git diff: instead of re-scanning the full file tree, read `git diff HEAD~1` and update only the files that changed in the last commit.*

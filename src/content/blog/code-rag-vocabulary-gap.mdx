@@ -1,0 +1,210 @@
+---
+title: "Closing the Vocabulary Gap with LLM-Generated Descriptions"
+tagline: "The error query went from not found to rank 7. Here's why rank 7 still isn't good enough — and what the score reveals about the trade-off between code vocabulary and incident vocabulary."
+date: 2026-06-11
+tags: ["rag", "architecture", "debugging"]
+readTime: 9
+series: "Code RAG in Production"
+seriesPart: 4
+seeAlso: ["code-rag-function-boundary-chunks"]
+---
+
+*Part 4 of the Code RAG series. Part 3 fixed the chunking split by extracting function-boundary chunks. This post tackles the second failure mode: the vocabulary gap — where the runtime error that fires in production appears nowhere in the source code.*
+
+---
+
+## The problem that chunking can't fix
+
+After Part 3, the search results for `moveAndRemoveFileFromS3` improved significantly. But one query was still completely broken:
+
+```
+Query: "S3 NoSuchKey missing key error"
+Line-based:        not found
+Function-boundary: not found
+```
+
+The function calls `s3.copyObject()` and `s3.deleteObject()`. When `copyObject` is called with a source key that doesn't exist in the bucket, the AWS SDK throws a `NoSuchKey` error. That's the production incident.
+
+But look at the source code:
+
+```javascript
+async function moveAndRemoveFileFromS3(bucket, imageObj) {
+  try {
+    await s3.copyObject({
+      Bucket: bucket,
+      CopySource: `${bucket}/${imageObj.source}`,
+      Key: `${imageObj.destination}`,
+    }).promise();
+    await s3.deleteObject({ Bucket: bucket, Key: imageObj.source }).promise();
+  } catch (error) {
+    console.log("moveAndRemoveFileFromS3 error", error, bucket, imageObj);
+  }
+}
+```
+
+Count the occurrences of "NoSuchKey" in that function: zero.
+
+The catch block logs `error` generically. There is no comment saying `// throws NoSuchKey if source key doesn't exist`. The function has no idea what specific error it can produce — it just catches everything and logs it.
+
+The vocabulary gap: the incident query uses `NoSuchKey`, the source code uses `copyObject`. These are the same concept — calling `copyObject` on a missing key produces `NoSuchKey` — but there's no shared token between them. The embedding model can't bridge that gap through geometric proximity alone; the two phrases live in different regions of embedding space.
+
+---
+
+## Why this is fundamentally different from the chunking problem
+
+The chunking problem (Part 3) was about dilution: good information was present in the source but buried alongside unrelated code, weakening the embedding signal. The fix was to isolate the function.
+
+The vocabulary gap is about absence: the information isn't in the source at all. No amount of chunk isolation fixes it. The word "NoSuchKey" is simply not there.
+
+Three approaches to close the gap:
+
+**Option A — Query expansion.** Before searching, rewrite the incident query to include source-code vocabulary. "S3 NoSuchKey missing key" becomes "S3 copyObject deleteObject missing key." Requires knowing the mapping from error names to API calls — either hardcoded or via an LLM call at query time.
+
+**Option B — Enrich at query time.** Don't change what's indexed; change how you search. Use a cross-encoder re-ranker that can reason about whether a function could throw a given error even if the word isn't there.
+
+**Option C — Enrich the index at index time.** When you index each function, append an LLM-generated description that includes the error names the function can throw. Embed code + description together. Now "NoSuchKey" is in the chunk's text.
+
+Option C is the right first step. It's a one-time cost at index time, requires no changes to the search query path, and the enriched embedding persists across all future queries.
+
+---
+
+## The implementation
+
+At index time, for each function, call Claude Haiku with this prompt:
+
+```
+Write a single sentence (max 40 words) describing this function.
+Include: what it does, what external APIs or services it calls,
+and what errors or exceptions it can throw (use the exact error names
+from those APIs, e.g. NoSuchKey, NotFound, ValidationError).
+Do not include the function name. Output only the sentence, no preamble.
+```
+
+This prompt is specific about including exact error names. Without that instruction, the model tends to say "may throw errors" rather than "throws NoSuchKey."
+
+The function passed to the model:
+
+```javascript
+async function moveAndRemoveFileFromS3(bucket, imageObj) {
+  try {
+    await s3.copyObject({ ... }).promise();
+    await s3.deleteObject({ Bucket: bucket, Key: imageObj.source }).promise();
+  } catch (error) {
+    console.log("moveAndRemoveFileFromS3 error", error, ...);
+  }
+}
+```
+
+Claude Haiku's response:
+
+> Copies an S3 object to a new location using AWS S3 API, then deletes the original, handling NoSuchKey and other S3 errors silently via console logging.
+
+The description contains `NoSuchKey`. Now the enriched chunk text is:
+
+```javascript
+async function moveAndRemoveFileFromS3(bucket, imageObj) {
+  try {
+    await s3.copyObject({ ... }).promise();
+    await s3.deleteObject({ ... }).promise();
+  } catch (error) {
+    console.log("moveAndRemoveFileFromS3 error", error, ...);
+  }
+}
+
+// Copies an S3 object to a new location using AWS S3 API, then deletes
+// the original, handling NoSuchKey and other S3 errors silently via console logging.
+```
+
+This is what gets embedded. The embedding now has signal from both vocabularies: `copyObject`, `deleteObject`, `bucket`, `key` from the code; `NoSuchKey`, S3, copies, deletes, errors from the description.
+
+---
+
+## The results
+
+Three-way comparison across all four queries:
+
+```
+Query                               Line-based    Fn-boundary   Enriched
+------------------------------------------------------------------------
+moveAndRemoveFileFromS3             r1  0.5596    r1  0.7093    r1  0.6749
+copy S3 object then delete source   r3  0.5035    r1  0.5719    r1  0.5717
+S3 copyObject deleteObject bucket   r4  0.5025    r2  0.5973    r2  0.6140
+S3 NoSuchKey missing key error      not found     not found     r7  0.2824
+```
+
+The vocabulary gap query now returns the function at rank 7, score 0.28.
+
+That's progress — it went from completely absent (rank ∞) to rank 7. But rank 7 is below the typical top-3 or top-5 cutoff. The LLM still wouldn't see this chunk.
+
+---
+
+## Why rank 7, not rank 1?
+
+The description worked: "NoSuchKey" is now in the chunk's text. But the score is 0.28 — quite low compared to the other queries (0.57–0.71). Why?
+
+The query is about the error, not the function. "S3 NoSuchKey missing key error" is asking about the incident — what went wrong. The enriched chunk describes the function — what it does. These are related but not the same semantic concept.
+
+The function description says "handling NoSuchKey and other S3 errors." That matches "NoSuchKey" lexically, but the embedding of the full description is still dominated by "copies an object," "deletes the original," "S3 API." The query is dominated by "NoSuchKey," "missing key," "error." The overlap is partial.
+
+The other chunks that ranked higher (ranks 1–6) are chunks that mention error handling, S3 errors, or key-not-found patterns more prominently — like `s3ObjectExists` (which explicitly checks for `NotFound`) and `deleteImageVariantsFromS3` (which calls `s3ObjectExists` before deleting).
+
+The function name query dropped slightly (0.7093 → 0.6749). Adding the description dilutes the pure function-name signal slightly. The function name appears once in the code; the description adds 30 more tokens that don't contain the function name. The embedding shifts toward the description vocabulary and slightly away from the exact identifier match.
+
+**This is the core trade-off: enriching the text for natural language queries slightly weakens exact-identifier queries.**
+
+---
+
+## What rank 7 means in practice
+
+Rank 7 is not good enough for a top-3 cutoff. But it's better than not found, which means it's in the right direction. To push it to top-3, you need more than a one-sentence description.
+
+**Longer description.** Instead of one sentence, generate a 3-5 sentence description that explicitly states: "When the source key does not exist in the bucket, the `copyObject` call throws a `NoSuchKey` error." More specific language → stronger match for the error query.
+
+**Separate description chunk.** Instead of appending the description to the code, store the description as a separate chunk with the function name as metadata. Now there are two chunks per function: one with the code (for code-style queries), one with the description (for incident-style queries). The right chunk surfaces for each query type without trade-offs.
+
+**Hybrid search.** Apply the same token-overlap lexical boost from the incident RAG series. "NoSuchKey" appears in the enriched text → lexical score 1.0. Even if the vector score is 0.28, the hybrid score would be `0.7 × 0.28 + 0.3 × 1.0 = 0.496` — enough to rank higher than chunks with higher vector scores but no lexical match.
+
+---
+
+## The progression across four parts
+
+```
+Part 2 (line-based, no descriptions):
+  "moveAndRemoveFileFromS3"          → rank 1, score 0.56
+  "copy S3 object delete source"     → rank 3, score 0.50
+  "S3 copyObject deleteObject"       → rank 4, score 0.50
+  "S3 NoSuchKey missing key error"   → not found
+
+Part 3 (function-boundary chunks):
+  "moveAndRemoveFileFromS3"          → rank 1, score 0.71  (+0.15)
+  "copy S3 object delete source"     → rank 1, score 0.57  (rank 3→1)
+  "S3 copyObject deleteObject"       → rank 2, score 0.60  (rank 4→2)
+  "S3 NoSuchKey missing key error"   → not found           (unchanged)
+
+Part 4 (enriched with LLM description):
+  "moveAndRemoveFileFromS3"          → rank 1, score 0.67  (slight drop from 0.71)
+  "copy S3 object delete source"     → rank 1, score 0.57  (unchanged)
+  "S3 copyObject deleteObject"       → rank 2, score 0.61  (slight improvement)
+  "S3 NoSuchKey missing key error"   → rank 7, score 0.28  (from not found — first appearance)
+```
+
+Part 3 improved three queries by fixing a structural problem (dilution). Part 4 made the previously-invisible query visible by adding missing information — but only to rank 7.
+
+The lesson: structural problems (chunking) and information problems (vocabulary gap) are different. Fix structural problems first — they're cheap and the gains are large. Then address information problems — they require generating new content and the gains are smaller.
+
+---
+
+## What this means for production
+
+A real production code RAG pipeline needs both:
+
+1. **Function-boundary chunks** — extract functions properly, one chunk per function. Eliminates dilution. This is the high-leverage fix.
+2. **LLM-generated descriptions** — append a description that includes exact error names, external API dependencies, and edge cases. Closes the vocabulary gap partially.
+3. **Hybrid search** — add lexical token overlap to boost chunks where the error name appears literally. Combines well with enriched descriptions.
+4. **Separate description chunks** — for incident queries, the description vocabulary is more relevant than the code vocabulary. Storing each as a separate chunk with shared metadata avoids the trade-off between code-query and incident-query performance.
+
+The order matters. Don't add LLM-generated descriptions on top of line-based chunks — the dilution problem will swamp the description signal. Fix chunking first, then enrich.
+
+---
+
+*This post completes the four-exercise Code RAG series. Starting from a line-count chunker that split functions across arbitrary 50-line windows, we built: structural diagnosis of two distinct failure modes, function-boundary extraction that eliminates dilution, and LLM-generated descriptions that partially close the vocabulary gap. Every change was measured.*

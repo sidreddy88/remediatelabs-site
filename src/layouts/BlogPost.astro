@@ -1,5 +1,6 @@
 ---
 import BaseLayout from "./BaseLayout.astro";
+import SeriesBanner from "../components/SeriesBanner.astro";
 import { getCollection } from "astro:content";
 
 interface Props {
@@ -9,9 +10,12 @@ interface Props {
   tags: string[];
   readTime: number;
   seeAlso?: string[];
+  series?: string;
+  seriesPart?: number;
+  slug?: string;
 }
 
-const { title, tagline, date, tags, readTime, seeAlso = [] } = Astro.props;
+const { title, tagline, date, tags, readTime, seeAlso = [], series, seriesPart, slug = "" } = Astro.props;
 
 const dateStr = date.toLocaleDateString("en-US", {
   year: "numeric",
@@ -70,6 +74,10 @@ const articleJsonLd = {
         ))}
       </div>
     </header>
+
+    {series && seriesPart && (
+      <SeriesBanner series={series} seriesPart={seriesPart} currentSlug={slug} />
+    )}
 
     <div class="prose prose-invert max-w-none prose-pre:bg-[#0d1117] prose-headings:scroll-mt-20 prose-h2:text-2xl prose-h2:mt-12 prose-h2:mb-4 prose-h3:mt-8 prose-h3:mb-3 prose-p:leading-relaxed">
       <slot />

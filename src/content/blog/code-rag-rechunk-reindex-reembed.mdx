@@ -1,0 +1,279 @@
+---
+title: "When to Re-chunk, Re-index, and Re-embed"
+tagline: "Three operations that sound similar. They are not. Each has different triggers, different costs, and different consequences if you get them wrong."
+date: 2026-07-02
+tags: ["rag", "architecture", "debugging"]
+readTime: 10
+series: "Code RAG in Production"
+seriesPart: 7
+seeAlso: ["code-rag-document-registry"]
+---
+
+*Part 7 of the Code RAG series. This post covers the three most confused operations in a RAG pipeline — and why conflating them costs money and silently degrades retrieval quality.*
+
+---
+
+## The three operations, defined
+
+Before the decision trees: clear definitions.
+
+**Chunking** is splitting a document into pieces. It's a pure text operation — no API calls, no database writes. Input: a file. Output: a list of text segments with line ranges.
+
+**Embedding** is converting a chunk of text into a vector. It requires an API call (or a local model inference). It's the expensive step — both in latency and cost. Input: text. Output: a list of 1536 numbers.
+
+**Indexing** is storing a vector (plus its metadata and original text) in the vector database. Input: a vector + metadata. Output: a row in ChromaDB or pgvector.
+
+These three operations are often discussed as if they're one thing ("re-index the codebase"). They're not. Understanding when each is needed separately is how you avoid paying for 5,000 embedding API calls when 20 files changed.
+
+One rule is absolute: **if you re-chunk, you must re-embed.** The vector stored in the database is computed from the chunk text. If the text changes and the vector doesn't, they disagree — every similarity score is computed against a vector that doesn't represent the stored text. Retrieval silently breaks. You can re-embed without re-chunking (model upgrade), but never re-chunk without re-embedding.
+
+---
+
+## Re-indexing is not the same as re-embedding
+
+"Re-index the codebase" is the phrase everyone uses, but it conflates two distinct operations.
+
+**Re-indexing** means writing to the vector database — inserting new rows, deleting old ones, or updating metadata on existing rows. It is always the final step of the pipeline, but it can also happen without re-embedding:
+- A file is deleted → delete its rows from the vector store. No embedding needed.
+- A file is renamed → update the `file_path` metadata on its existing rows. The vector is still correct — the text didn't change, only the path did.
+
+**Re-embedding** means calling the embedding model to produce new vectors. It always requires re-indexing afterward (a vector that isn't stored is useless), but re-indexing does not always require re-embedding.
+
+```
+Re-embedding always triggers re-indexing.
+Re-indexing does NOT always require re-embedding.
+```
+
+---
+
+## The three triggers
+
+There are exactly three things that can make your index stale:
+
+1. Document content changed — a file was edited, added, or deleted
+2. Chunking strategy changed — you decided to split files differently
+3. Embedding model changed — you switched to a different model
+
+Each trigger has a different blast radius.
+
+---
+
+## Trigger 1: Document content changed
+
+A file in your codebase was edited. What needs to happen?
+
+```
+File content changed
+  ↓
+Re-chunk that file        ← pure text operation, no API calls
+  ↓
+Re-embed the new chunks   ← API call per chunk, this is the expensive step
+  ↓
+Re-index: delete old chunk IDs from vector store   ← write to DB
+Re-index: insert new chunks + vectors into store   ← write to DB
+Re-index: update registry (mark old as superseded, register new)
+```
+
+Scope: one file only. Every other file in the repo is unchanged and needs nothing.
+
+This is what the document registry from Part 6 handles. The content hash check catches this:
+
+```python
+# sha256 of raw file bytes
+new_hash = hashlib.sha256(raw).hexdigest()
+stored_hash = registry.get_hash(file_path)
+
+if new_hash == stored_hash:
+    return 0   # nothing changed, skip everything
+```
+
+If the hash matches: no re-chunking, no re-embedding, no re-indexing. Zero cost. If the hash doesn't match: re-chunk the file, re-embed the new chunks, delete the old chunk IDs, insert the new ones.
+
+**What if the file was deleted?**
+
+Deletion is a special case. The indexer never visits a deleted file, so it never triggers the hash check. You have to handle deletions explicitly:
+
+```python
+# At the end of an indexing run:
+indexed_files = set of files just processed
+registry_files = set of doc_ids in the registry with status='active'
+
+stale = registry_files - indexed_files   # files deleted from repo
+for doc_id in stale:
+    old_ids = registry.get_chunk_ids(doc_id)
+    vector_store.delete(old_ids)
+    registry.mark_superseded(doc_id)
+```
+
+The current implementation doesn't do this yet — it's the "deleted files" gap mentioned at the end of Part 6.
+
+---
+
+## Trigger 2: Chunking strategy changed
+
+You've been chunking by fixed 50-line windows. You decide to switch to function-boundary chunking (as in Part 3). What needs to happen?
+
+```
+Chunking strategy changed
+  ↓
+Re-chunk EVERY file       ← pure text operation, no API calls
+  ↓
+Re-embed EVERY chunk      ← API call per chunk, expensive
+  ↓
+Re-index: clear old collection  (chunk IDs from old strategy are meaningless)
+Re-index: insert all new chunks + vectors into store
+Re-index: rebuild registry from scratch
+```
+
+Scope: the entire corpus. Every file, every chunk.
+
+This is a full rebuild — there is no shortcut. Chunk IDs are derived from `sha256("file_path:start_line")`. If line boundaries shift (which they do when you change chunking strategy), the IDs change, and you cannot diff old against new.
+
+The right approach: alias-based deployment. Build the new index in a parallel collection (`codebase_v2`), validate it against a benchmark query set, then swap the alias. The old index stays warm until you're confident.
+
+```python
+# Build new collection without touching the live one
+rag_v2 = RAGService(collection_name="codebase_v2")
+await rag_v2.index_directory(CODEBASE_PATH)
+
+# Validate
+results = await rag_v2.search("moveAndRemoveFileFromS3")
+assert results[0].score > 0.70
+
+# Swap — update COLLECTION_NAME in config to "codebase_v2"
+```
+
+During the build, every query still hits `codebase_v1`. No user sees a partial index.
+
+---
+
+## Trigger 3: Embedding model changed
+
+You switch from `text-embedding-3-small` to `text-embedding-3-large`. What needs to happen?
+
+```
+Embedding model changed
+  ↓
+Re-embed EVERY chunk      ← API call per chunk, expensive (no re-chunking needed)
+  ↓
+Re-index: clear old collection  (all vectors are wrong — different model's space)
+Re-index: insert all chunks with new vectors
+Re-index: update registry model metadata
+```
+
+Scope: the entire corpus. Even files that haven't changed.
+
+This is the hardest rebuild because it doesn't matter that the document content is the same. The vectors are wrong — not wrong in the sense of "stale content," but wrong in the sense that they were computed in a different geometric space. A query embedded with model B cannot meaningfully compare to documents embedded with model A.
+
+Think of it this way: imagine model A maps "apple" to the point (0.1, 0.9) and model B maps "apple" to (0.7, 0.2). The cosine distance between a model-B query for "apple" and a model-A document about "apple" is large — they disagree about where "apple" lives in space — even though the document is exactly what you want.
+
+```python
+# Efficient re-embed: reuse existing chunk text, don't re-read files
+existing_chunks = vector_store.all_items()
+new_embeddings = await embed_all(
+    [chunk.document for chunk in existing_chunks],
+    model="text-embedding-3-large"
+)
+new_collection.upsert(zip(existing_chunks, new_embeddings))
+```
+
+Practical safeguard: store the embedding model name in every chunk's metadata. Before querying, assert it matches.
+
+```python
+# In metadata stored with each chunk:
+{"model": "text-embedding-3-small", "model_version": "1", ...}
+
+# In query:
+if stored_model != query_model:
+    raise ValueError(f"Index was built with {stored_model}, querying with {query_model}")
+```
+
+---
+
+## Where re-indexing fits
+
+Re-indexing has no cost of its own — it is just SQL writes. The question for re-indexing is never "should I do it?" It is "what kind of re-index do I need?"
+
+Three kinds:
+- **Insert** — a new file is added, or a changed file produces new chunks. Embed the new chunks, then insert them into the vector store and register the new chunk IDs.
+- **Delete** — a file was changed or deleted. The old chunk IDs still exist. Fetch them from the registry, delete them from the store, mark them as superseded. No embedding needed.
+- **Metadata update only** — a file was renamed or moved. The text didn't change, so the vector is still correct. Just update the `file_path` field on existing rows. No embed call, no new chunk, no delete.
+
+The registry separates these cleanly:
+
+```
+Text changed   → re-chunk + re-embed + re-index (delete old, insert new)
+File deleted   → re-index only (delete rows)
+File renamed   → re-index only (update metadata)
+Nothing changed → skip everything
+```
+
+---
+
+## The decision matrix
+
+| What changed | Re-chunk? | Re-embed? | Re-index? | Scope |
+|---|---|---|---|---|
+| One file edited | Yes (that file) | Yes (new chunks) | Yes (delete old, insert new) | 1 file |
+| File deleted | No | No | Yes (delete rows) | 1 file |
+| New file added | Yes | Yes | Yes (insert rows) | 1 file |
+| Chunking strategy changed | Yes (all files) | Yes (all chunks) | Yes (full rebuild) | Full corpus |
+| Embedding model changed | No | Yes (all chunks) | Yes (full rebuild) | Full corpus |
+| File renamed | No | No | Yes (update metadata only) | 1 file |
+| Nothing changed | No | No | No | Skip |
+
+---
+
+## The cost hierarchy
+
+```
+Read file from disk:                          ~0 cost
+Hash the content:                             ~0 cost
+Re-chunk a file:                              ~0 cost  (pure CPU, no API)
+Re-index: delete old chunks from vector store ~0 cost  (one SQL/ChromaDB delete)
+Re-index: insert new chunks into vector store ~0 cost  (one SQL/ChromaDB write)
+Re-index: update registry row                 ~0 cost  (one SQL write)
+Re-embed one chunk:                           ~$0.00002 (text-embedding-3-small, 512 tokens)
+Re-embed 5,500 chunks:                        ~$0.11   (full AllInterviews corpus)
+Re-embed 500k chunks:                         ~$10     (large codebase, full rebuild)
+```
+
+Re-chunking is free. Re-indexing is free. Re-embedding is the only expensive operation.
+
+The hash check converts re-embedding from O(corpus size) to O(changed files). A PR that touches 20 files out of 5,000 costs 20 embed calls, not 5,000. That's a 250x cost reduction on every incremental run.
+
+The registry is the mechanism that makes deletion possible without a full rebuild. Without it, you have no way to know which chunk IDs to delete when a file changes. The registry stores the mapping cheaply at index time so deletion at update time is a single O(1) lookup.
+
+The chain of reasoning: re-embedding costs money → hash-check files to skip unchanged ones → need the hash stored somewhere → registry → the registry also stores chunk IDs → enables correct deletion → stale vectors don't accumulate → retrieval stays honest. Every piece exists because re-embedding costs money.
+
+---
+
+## Common mistakes
+
+**Mistake 1: Re-embedding on every index run.**
+No hash check, so every run re-embeds all files regardless of whether they changed. Costs money every time you run it, produces no improvement in retrieval quality.
+
+**Mistake 2: Re-embedding when only metadata changed.**
+A file rename, a timestamp update, a path restructure. The vector for the chunk is still correct. Only the metadata (`file_path` field) needs updating — no embed call required.
+
+**Mistake 3: Not re-embedding when chunking strategy changes.**
+Switching to function-boundary chunks but keeping old vectors from the line-based chunks. The chunk IDs change (different `start_line` values), so the upsert inserts new chunks — but the old chunks are never deleted. Both strategies coexist in the collection, with searches returning a mix. Quality is worse than either strategy alone.
+
+**Mistake 4: Not rebuilding when the embedding model changes.**
+This is the silent worst case. The index looks fine. Queries return results. The scores are meaningless. A query embedded with model B is being compared to documents embedded with model A. The cosine distances are geometrically wrong. You won't catch this without an eval harness running against known correct answers.
+
+---
+
+## The mental model
+
+Three questions in order:
+
+1. **Did the text change?** If no: skip. If yes: re-chunk + re-embed that file. Delete old chunks.
+2. **Did the chunking strategy change?** If yes: full rebuild (all files, all chunks). Use alias-based deployment.
+3. **Did the embedding model change?** If yes: full re-embed (all chunks, no re-chunk). Use alias-based deployment.
+
+Answer these three questions before any index operation and you'll never pay for unnecessary embed calls and never serve stale results.
+
+---
+
+*Next: Part 8 — incremental indexing via git diff: instead of re-scanning the full file tree, read `git diff HEAD~1` and update only the files that changed in the last commit.*

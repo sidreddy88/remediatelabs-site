@@ -10,6 +10,22 @@ const posts = (await getCollection("blog")).sort(
 const allTags = Array.from(
   new Set(posts.flatMap((p) => p.data.tags))
 ).sort();
+
+const seriesNames = [...new Set(
+  posts.map((p) => p.data.series).filter(Boolean)
+)] as string[];
+
+const seriesMap = seriesNames.map((name) => {
+  const parts = posts
+    .filter((p) => p.data.series === name)
+    .sort((a, b) => (a.data.seriesPart ?? 0) - (b.data.seriesPart ?? 0));
+  return {
+    name,
+    slug: name.toLowerCase().replace(/\s+/g, "-"),
+    count: parts.length,
+    tagline: parts[0]?.data.tagline ?? "",
+  };
+});
 ---
 
 <BaseLayout
@@ -33,7 +49,27 @@ const allTags = Array.from(
     </div>
   </section>
 
+  {seriesMap.length > 0 && (
+    <section class="container-wide pb-12">
+      <h2 class="text-xs uppercase tracking-wider text-muted mb-4">Series</h2>
+      <div class="grid md:grid-cols-2 gap-4">
+        {seriesMap.map((s) => (
+          <a
+            href={`/blog/series/${s.slug}`}
+            class="block rounded-lg border border-border bg-surface px-5 py-4 hover:border-accent transition-colors no-underline group"
+          >
+            <p class="text-sm font-medium text-ink group-hover:text-accent transition-colors">
+              {s.name}
+            </p>
+            <p class="text-xs text-muted mt-1">{s.count} parts</p>
+          </a>
+        ))}
+      </div>
+    </section>
+  )}
+
   <section class="container-wide pb-20">
+    <h2 class="text-xs uppercase tracking-wider text-muted mb-4">All posts</h2>
     <div class="grid md:grid-cols-2 gap-5">
       {posts.map((post) => (
         <BlogCard

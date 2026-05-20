@@ -1,0 +1,292 @@
+---
+title: "Observability and Retrieval Tracing"
+tagline: "Production RAG systems fail in ways that look like LLM hallucinations but are actually retrieval problems. Without chunk-level tracing, you cannot tell the difference."
+date: 2026-07-16
+tags: ["rag", "architecture", "debugging"]
+readTime: 9
+series: "Code RAG in Production"
+seriesPart: 9
+seeAlso: ["code-rag-alias-deployment"]
+---
+
+*Part 9 of the Code RAG series. Parts 1–8 built a pipeline that indexes correctly, retrieves relevantly, and rebuilds safely. This post covers the failure mode that none of that prevents: answers that are wrong in ways you cannot see.*
+
+---
+
+## The invisible failure
+
+Production RAG systems fail in ways that look like LLM problems but are actually retrieval problems. The answer is confidently wrong not because the model hallucinated — it faithfully reasoned over the wrong context. It did exactly what it was supposed to do with what it was given. The model is not the bug.
+
+Without end-to-end tracing, you cannot distinguish these two failure modes:
+
+```
+User:    "How do I reset my API key?"
+System:  "You can reset your API key by navigating to Settings → Security
+          and clicking Regenerate. Note that all existing integrations using
+          the old key will stop working immediately."
+
+[The settings page was redesigned 3 months ago. The old path no longer exists.
+ The system returned a chunk from a deprecated help doc. The LLM did not hallucinate —
+ it correctly summarized text that is now wrong.]
+```
+
+From the outside, this looks like a hallucination. With retrieval tracing, you open the trace, see that the top chunk came from `docs/v1/api-keys.md` last indexed 4 months ago, and the diagnosis takes 30 seconds.
+
+The standard observability stack — traces, metrics, logs via OpenTelemetry — applies here, but a RAG pipeline has primitives that OTel's generic span model does not capture natively. Similarity scores, chunk provenance, index versions, and reranking decisions need to be instrumented explicitly. This post covers how.
+
+---
+
+## The span architecture
+
+A complete RAG request should produce a trace with these spans nested under a single root:
+
+```
+rag_request (root)
+  ├── embedding.query          (latency, model, input tokens)
+  ├── retrieval.vector_search  (latency, num_results, top_k, filter applied)
+  ├── retrieval.rerank         (latency, num_input, num_output, model)
+  ├── prompt.assembly          (latency, total_tokens, num_chunks_used)
+  └── llm.generate             (latency, model, input_tokens, output_tokens, stop_reason)
+```
+
+Each span carries structured attributes. The spans themselves are cheap to produce — you are adding metadata to operations you are already running. The cost is zero. The debugging value is high.
+
+```python
+from opentelemetry import trace
+
+tracer = trace.get_tracer("rag_service")
+
+async def query(self, question: str) -> RAGResponse:
+    with tracer.start_as_current_span("rag_request") as root:
+        root.set_attribute("query", question)
+        root.set_attribute("index.collection", self._collection_name)
+        root.set_attribute("index.version", self._index_version)
+
+        with tracer.start_as_current_span("embedding.query") as span:
+            query_vector = await self._embed([question])
+            span.set_attribute("embedding.model", EMBEDDING_MODEL)
+            span.set_attribute("embedding.input_tokens", token_count(question))
+
+        with tracer.start_as_current_span("retrieval.vector_search") as span:
+            raw_results = self._collection.query(query_vector, n_results=TOP_K)
+            span.set_attribute("retrieval.top_k", TOP_K)
+            span.set_attribute("retrieval.num_results", len(raw_results))
+            span.set_attribute("retrieval.min_score", self._min_score)
+            for i, r in enumerate(raw_results):
+                span.add_event("chunk_retrieved", {
+                    "rank": i,
+                    "score": r.score,
+                    "doc_id": r.metadata["file_path"],
+                    "start_line": r.metadata["start_line"],
+                    "end_line": r.metadata["end_line"],
+                    "chunk_id": r.metadata["chunk_id"],
+                })
+
+        with tracer.start_as_current_span("retrieval.rerank") as span:
+            reranked = self._rerank(question, raw_results)
+            span.set_attribute("rerank.num_input", len(raw_results))
+            span.set_attribute("rerank.num_output", len(reranked))
+
+        with tracer.start_as_current_span("prompt.assembly") as span:
+            prompt = self._build_prompt(question, reranked)
+            span.set_attribute("prompt.total_tokens", token_count(prompt))
+            span.set_attribute("prompt.num_chunks", len(reranked))
+
+        with tracer.start_as_current_span("llm.generate") as span:
+            answer = await self._llm.generate(prompt)
+            span.set_attribute("llm.model", LLM_MODEL)
+            span.set_attribute("llm.input_tokens", answer.usage.input_tokens)
+            span.set_attribute("llm.output_tokens", answer.usage.output_tokens)
+            span.set_attribute("llm.stop_reason", answer.stop_reason)
+
+        return RAGResponse(answer=answer.text, chunks=reranked)
+```
+
+The `chunk_retrieved` events inside `retrieval.vector_search` are what make bad answers debuggable. When you investigate a support ticket about a wrong answer, you open the trace, expand the retrieval span, and immediately see which chunks scored highest and where they came from. "The system retrieved three chunks from the deprecated v1 policy document" is an actionable finding. "The system returned a bad answer" is not.
+
+---
+
+## Logging the "why"
+
+A common question in production is not just "what was retrieved?" but "why did the system think this was relevant?" The similarity score alone does not answer this. A score of 0.82 might be genuinely relevant, or it might be a false positive from an embedding space where the query and an unrelated chunk happen to land nearby.
+
+For the AllInterviews codebase (Part 2), we saw this directly: the query `"classifyFields"` returned a TypeError incident as rank 1 with score 0.235, not because it was about `classifyFields`, but because the embedding space placed error classification semantics close to field classification semantics. The score gave no indication the result was a false positive.
+
+To address this, add a lightweight rationale step after reranking:
+
+```python
+RATIONALE_PROMPT = """\
+You will receive a search query and up to 5 retrieved context chunks.
+For each chunk, explain in one sentence why it is or is not relevant to the query.
+Be brief. This output is for debugging, not for the user.
+
+Query: {query}
+
+Chunks:
+{chunks}
+"""
+
+async def _log_retrieval_rationale(self, query: str, chunks: list[Chunk], trace_id: str) -> None:
+    prompt = RATIONALE_PROMPT.format(
+        query=query,
+        chunks="\n\n".join(f"[{i+1}] {c.document[:300]}" for i, c in enumerate(chunks))
+    )
+    rationale = await self._llm.generate(prompt, model="claude-haiku-4-5")
+    logger.info(
+        "retrieval_rationale",
+        extra={"trace_id": trace_id, "query": query, "rationale": rationale.text}
+    )
+```
+
+This is expensive if run per-request. Run it on a sampled basis instead — 1% of production traffic, plus 100% of user-flagged responses. The rationale becomes a structured log field queryable in your observability platform. Over time, patterns in the rationale ("chunk came from file X but query was about Y") point directly at indexing or chunking problems.
+
+---
+
+## Retrieval quality vs answer quality
+
+The highest-value observability investment is closing the feedback loop: connecting what was retrieved to how good the final answer was.
+
+Use a lightweight LLM-as-judge approach. After the main LLM generates an answer, send the answer, the retrieved context, and the original question to a smaller, cheaper model with a scoring rubric:
+
+```python
+JUDGE_PROMPT = """\
+You are evaluating a RAG system response. Score on two dimensions.
+
+Question: {question}
+
+Retrieved context:
+{context}
+
+System answer: {answer}
+
+Score each dimension from 0.0 to 1.0:
+
+faithfulness: Did the answer stay within what the retrieved context says?
+  1.0 = every claim in the answer is supported by the context
+  0.0 = the answer contradicts or ignores the context entirely
+
+relevance: Did the answer address the question?
+  1.0 = fully answers the question
+  0.0 = does not address the question at all
+
+Respond with JSON: {{"faithfulness": float, "relevance": float, "notes": "one-line explanation"}}
+"""
+
+async def _evaluate_response(
+    self,
+    question: str,
+    chunks: list[Chunk],
+    answer: str,
+    trace_id: str,
+) -> None:
+    context = "\n\n".join(c.document for c in chunks)
+    prompt = JUDGE_PROMPT.format(question=question, context=context, answer=answer)
+    result = await self._llm.generate(prompt, model="claude-haiku-4-5")
+
+    try:
+        scores = json.loads(result.text)
+        span = trace.get_current_span()
+        span.set_attribute("eval.faithfulness", scores["faithfulness"])
+        span.set_attribute("eval.relevance", scores["relevance"])
+        logger.info("rag_eval", extra={
+            "trace_id": trace_id,
+            "faithfulness": scores["faithfulness"],
+            "relevance": scores["relevance"],
+            "notes": scores.get("notes"),
+        })
+    except (json.JSONDecodeError, KeyError):
+        pass
+```
+
+This gives you a queryable dataset: "show me all requests where faithfulness score was below 0.7 in the last 7 days."
+
+Drilling into those traces, you will typically find one of three patterns:
+
+| Pattern | What you see in the trace | Root cause |
+|---|---|---|
+| Wrong document | Top chunks from stale or deleted file | Index drift or missing deletion |
+| Right document, wrong section | Top chunks from adjacent function / heading | Chunking boundary problem |
+| Correct chunks, wrong answer | High faithfulness but low relevance | Generation problem — not retrieval |
+
+Only traces with chunk-level attribution let you distinguish these cases. Without them, every bad answer looks identical from the outside.
+
+---
+
+## Index version attribution
+
+One failure mode deserves special mention: your index was updated, retrieval behavior changed, and answer quality dropped. Without index version attribution in your traces, you cannot correlate the quality drop to the update.
+
+This is not a hypothetical. Every time you swap the alias to a new collection, change the chunking strategy, or upgrade the embedding model — retrieval behavior changes. Sometimes it gets better. Sometimes it regresses in ways you won't notice until users complain.
+
+The fix is to attach the index version to every retrieval span:
+
+```python
+span.set_attribute("retrieval.index_version", self._index_version)
+span.set_attribute("retrieval.index_collection", self._collection_name)
+span.set_attribute("retrieval.index_updated_at", self._index_metadata["updated_at"])
+```
+
+In the alias-swap flow from Part 8, `_index_version` is the version string set when you call `swap_index(new_version)`. Every request that hit the old collection and every request that hit the new collection is now labeled.
+
+```python
+# Pseudocode — Langfuse / Datadog / Honeycomb query
+traces
+  .filter(eval.faithfulness < 0.7)
+  .filter(timestamp > "2026-05-14T15:00:00Z")  # when the swap happened
+  .group_by(retrieval.index_version)
+  .count()
+
+# If v1732456789 shows 3x more low-quality results than v1732456000,
+# the swap introduced a regression. Roll back immediately.
+```
+
+This sounds obvious in retrospect. Almost nobody instruments it until they spend a painful post-incident trying to figure out why answer quality degraded on a Tuesday afternoon.
+
+---
+
+## The Langfuse integration
+
+For the agent-platform, Langfuse already traces every LLM call through the `@trace_agent` decorator in `app/services/tracing.py`. RAG retrieval sits outside the agent loop, so it doesn't get traced automatically.
+
+The integration point is `RAGService.search()` in `app/services/rag.py`. The search call happens inside `FixGenerationAgent` and `IncidentResponseAgent` before the LLM call — it's the first operation of every agent run. Adding a retrieval span there connects the chunk provenance to the downstream LLM generation in a single trace.
+
+```python
+# In RAGService.search():
+from langfuse.decorators import observe
+
+@observe(name="retrieval.vector_search")
+async def search(self, query: str, n_results: int = 5, min_score: float = 0.0) -> list[SearchResult]:
+    # ... existing implementation ...
+    langfuse_context.update_current_observation(
+        metadata={
+            "collection": self._collection._name,
+            "index_version": self._index_version,
+            "num_results_before_filter": len(raw_results),
+            "num_results_after_filter": len(results),
+            "top_score": results[0].score if results else None,
+        }
+    )
+    return results
+```
+
+Now every agent trace in Langfuse shows the retrieval step: what query was embedded, which chunks were returned with what scores, and which version of the index they came from.
+
+---
+
+## Metrics to track
+
+Beyond per-request traces, track these aggregates:
+
+| Metric | What it catches |
+|---|---|
+| `retrieval.top_score` p50/p95 | Index drift — scores drop when chunking/model diverges from queries |
+| `retrieval.num_results_after_filter` | `min_score` calibration — if frequently 0, threshold is too high |
+| `eval.faithfulness` p50 | Answer quality trend — drops after index rebuilds or model upgrades |
+| `retrieval.latency` p99 | Vector store performance under load |
+| `embedding.query.latency` p99 | OpenAI API latency — spikes propagate directly to user-facing latency |
+
+Alert on `eval.faithfulness` p50 dropping below your acceptable floor — for code search, 0.7 is a reasonable threshold. A drop below it means something in the pipeline changed that you need to investigate.
+
+---
+
+*This post completes the nine-part Code RAG series. Starting from a line-count chunker that split functions across arbitrary windows, we built: structural diagnosis of two failure modes, function-boundary extraction, LLM-generated descriptions, hybrid search, a document registry, three-way decision logic for re-chunking vs re-embedding vs re-indexing, alias-based zero-downtime rebuilds, and end-to-end retrieval tracing. Every change was measured against real code from a production codebase.*

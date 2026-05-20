@@ -1,0 +1,159 @@
+---
+title: "Search Quality — Two Failure Modes and Why They're Different"
+tagline: "One failure is a chunking problem. The other is a vocabulary gap that better chunking can't fix. Here's what the scores reveal about code RAG's limits."
+date: 2026-05-28
+tags: ["rag", "architecture", "debugging"]
+readTime: 7
+series: "Code RAG in Production"
+seriesPart: 2
+seeAlso: ["code-rag-what-gets-indexed"]
+---
+
+*Part of a series on building production RAG over a real JavaScript codebase. Part 1 showed how 50-line chunks split functions across boundaries. This exercise measures what that actually costs in search quality — and finds a second, deeper failure that chunking alone can't fix.*
+
+---
+
+## Setup
+
+The target: `moveAndRemoveFileFromS3`, the function at the center of the S3 NoSuchKey incident. It lives at line 479 of `routes/services/image.js` and does exactly two things — copy an S3 object to a new key, then delete the original.
+
+```javascript
+async function moveAndRemoveFileFromS3(bucket, imageObj) {
+  try {
+    if (!imageObj.source || !imageObj.destination) return;
+    if (imageObj.source === imageObj.destination) return;
+
+    await s3
+      .copyObject({
+        Bucket: bucket,
+        CopySource: `${bucket}/${imageObj.source}`,
+        Key: `${imageObj.destination}`,
+      })
+      .promise();
+    await s3.deleteObject({ Bucket: bucket, Key: imageObj.source }).promise();
+  } catch (error) {
+    console.log("moveAndRemoveFileFromS3 error", error, bucket, imageObj);
+  }
+}
+```
+
+From Part 1 we know this function is split across two chunks:
+
+- **Chunk 441–490**: contains the function declaration (`async function moveAndRemoveFileFromS3`) but only the first 11 lines of the body, mid-way through the `.copyObject()` call
+- **Chunk 481–530**: starts inside the function body — has `.copyObject()`, `.deleteObject()`, the catch block — but no function declaration
+
+I ran four queries against the full index (5306 chunks from 428 files) and tracked where these two chunks ranked.
+
+---
+
+## The four queries
+
+```
+Query                                        Target chunk 441  Target chunk 481
+---------------------------------------------------------------------------
+moveAndRemoveFileFromS3                      rank 1  (0.5596)  not in top 5
+copy S3 object then delete source            rank 3  (0.5035)  rank 4 (0.4353)
+S3 copyObject deleteObject bucket key        rank 4  (0.5025)  not in top 5
+S3 NoSuchKey missing key error               not in top 5      not in top 5
+```
+
+The scores tell two distinct stories.
+
+---
+
+## Failure mode 1: the chunking split
+
+Query 1 (`moveAndRemoveFileFromS3`) scores 0.56 for the declaration chunk and doesn't surface the body chunk at all.
+
+This is the chunking split from Part 1 playing out in search. The function name appears in the declaration chunk (line 479) and in the error log inside the catch block (line 493: `console.log("moveAndRemoveFileFromS3 error", ...)`). The body chunk (481–530) doesn't contain the function name at all. So when you query the exact function name, you find the chunk with the name but not the chunk with the implementation.
+
+The practical consequence: an agent doing code search for `moveAndRemoveFileFromS3` gets back a chunk that's 60% unrelated code (lines 441–478 belong to a completely different function) plus only the declaration and first 11 lines of the function. It never sees the `copyObject` + `deleteObject` implementation.
+
+Query 2 (`copy S3 object then delete source`) does slightly better — both target chunks appear in the top 5. But the top two results are lines 601–650 and 641–690, which are a different S3 deletion function (`deleteImageVariantsFromS3`). That function explicitly calls `deleteObject` and checks `s3ObjectExists`. The semantic match is strong enough that it outranks the actual target.
+
+This is another consequence of chunking: the 50-line window mixes `moveAndRemoveFileFromS3` (a 26-line function) with surrounding code. The chunk's semantic signal is diluted by context that has nothing to do with the query.
+
+---
+
+## Failure mode 2: the vocabulary gap
+
+Query 4 (`S3 NoSuchKey missing key error`) fails completely. Neither target chunk appears in the top 5. The scores collapse to 0.34 — barely above noise.
+
+This is not a chunking problem. You could have perfect function-boundary chunks and this query would still fail.
+
+The reason: the runtime error has no textual trace in the source code.
+
+The incident that triggered the S3 NoSuchKey alert was: `copyObject` throwing `NoSuchKey` when the source key didn't exist. But the source code says:
+
+```javascript
+await s3.copyObject({
+  Bucket: bucket,
+  CopySource: `${bucket}/${imageObj.source}`,
+  Key: `${imageObj.destination}`,
+}).promise();
+```
+
+There is no `NoSuchKey`. No comment like `// throws NoSuchKey if source doesn't exist`. No error code in the catch block — just `console.log("moveAndRemoveFileFromS3 error", error, ...)`. The source and the error live in completely different vocabularies.
+
+Compare this to incident RAG, where we indexed the error text itself:
+
+```
+S3_NO_SUCH_KEY: S3 throws NoSuchKey on missing key | Root cause: ...
+```
+
+That text contains the exact terms that appear in error queries. Code RAG doesn't have that advantage — the function call and the exception it can throw are two different documents with no shared tokens.
+
+---
+
+## Why this matters more than the chunking split
+
+The chunking split is a fixable engineering problem. You can chunk by function boundary instead of line count. 50-line chunks become "one function per chunk" — you parse the file with a proper AST, extract function definitions, and store each as its own document. This is strictly better for code search.
+
+The vocabulary gap is a harder problem. It's not about how you chunk. It's about what information you have. The source code describes what the function does. The error query describes what the function can fail with. Those are different things and they don't share vocabulary unless a developer explicitly wrote comments linking them.
+
+Three approaches to close the gap:
+
+**1. Enrich the indexed text at index time.** For each function, generate a description: "this function calls `copyObject` and `deleteObject`; it can throw `NoSuchKey` if the source key doesn't exist." Store that alongside the raw source. Now the chunk's embedded text spans both vocabularies. Cost: one LLM call per function at index time. Quality depends on the LLM's knowledge of the AWS SDK.
+
+**2. Query expansion at search time.** Before searching, rewrite the incident query to include likely source vocabulary. "S3 NoSuchKey missing key" → "copyObject deleteObject S3 key missing". Cost: one LLM call per query. Requires knowing what SDK calls can throw what errors.
+
+**3. Accept the gap and use the GitHub API for the last mile.** The incident RAG already retrieves the right past incident (what failed and why). The code RAG retrieves semantically related source (what code is involved). If neither retrieves the exact function, the agent can still find it via GitHub's `search_code` API with the exact function name. Code RAG is a first-pass filter, not the only path.
+
+Option 3 is what the current system does. Options 1 and 2 are covered in Exercise 4.
+
+---
+
+## Score calibration for code RAG
+
+The scores in this exercise are worth examining independently of rankings:
+
+```
+Best result for any query:        0.56  (function name, declaration chunk)
+Best result for natural language: 0.50  (copy/delete description)
+Best result for incident terms:   0.34  (NoSuchKey query)
+```
+
+Compare this to incident RAG, where a correct dedup match scored 0.91 and an exact-match incident scored 0.79. Code search scores are 30–40% lower across the board.
+
+This is expected. Incident text was written in natural language about concepts the embedding model understands. Source code is written in a mix of identifiers, API calls, and language syntax — it maps more weakly to the embedding model's training distribution, which was mostly natural language text.
+
+The practical implication: don't port the `min_score=0.80` threshold from incident RAG to code RAG. A score of 0.55 for code search is a good match. A score of 0.35 is noise. Calibrate separately.
+
+---
+
+## Summary
+
+Two distinct failure modes:
+
+| Failure | Root cause | Fixable by better chunking? |
+|---|---|---|
+| Function declaration and body in separate chunks | Fixed line-count windows don't respect function boundaries | Yes — chunk by function boundary |
+| Incident error vocabulary absent from source code | Runtime errors aren't annotated in source | No — requires richer indexed text or query expansion |
+
+The chunking split means a query for the function name returns a chunk with diluted context. The vocabulary gap means a query for the incident error returns nothing at all. Both are real, but they're different problems with different solutions.
+
+Part 3 will fix the chunking split by building function-boundary chunks. Part 4 will tackle the vocabulary gap.
+
+---
+
+*Next: Part 3 — function-boundary chunking with a real AST parser: one chunk per function, sized to the function, not to an arbitrary line count.*
