@@ -4,6 +4,8 @@ tagline: "Five PRs to teach a fix-generation pipeline that the crash site is alm
 date: 2026-05-02
 tags: ["debugging", "agents", "rag"]
 readTime: 8
+series: "Agent Debugging"
+seriesPart: 3
 ---
 
 I built a closed-loop incident remediation system. When a production error hits my ECS clusters, an agent detects it, diagnoses the root cause, generates a fix, opens a PR, and routes it for review. The goal: mean time to resolution under 5 minutes, no human debugging required.
