@@ -58,6 +58,7 @@ const stack = [
 ];
 
 const agents = [
+  { name: "IncidentResponseAgent", role: "Orchestrates the full pipeline. Receives error events, runs dedup checks, coordinates Triage → Diagnosis → Fix in sequence, and manages the approval gate.", pattern: "Orchestrator + tool chain" },
   { name: "TriageAgent", role: "Classifies events as real / noise / duplicate. P0–P3 severity. Haiku for cost.", pattern: "ReAct + typed wrapper" },
   { name: "DiagnosisAgent", role: "Roots every claim against the live repo via GitHub Code Search.", pattern: "ReAct + grounding guards" },
   { name: "FixGenerationAgent", role: "Writes the patch. Runs it in a Docker sandbox. Retries 3× on test failure.", pattern: "Direct LLM + sandbox loop" },
@@ -76,7 +77,7 @@ const agents = [
       agent-platform
     </h1>
     <p class="text-muted text-lg mt-4 max-w-3xl leading-relaxed">
-      A 5-agent pipeline that detects production crashes, grounds the diagnosis against the actual
+      A 6-agent pipeline that detects production crashes, grounds the diagnosis against the actual
       repo, generates a patch, validates it in a Docker sandbox, and opens a PR — with a human
       approval gate before any merge, escalating urgency for HIGH/CRITICAL severity.
     </p>
@@ -178,7 +179,7 @@ const agents = [
       </li>
       <li>
         <strong class="text-ink">RAG finds candidates. The live store confirms truth.</strong>
-        ChromaDB (and now pgvector) holds index-time snapshots; current incident state lives in
+        pgvector holds index-time snapshots; current incident state lives in
         Postgres. Blocking decisions always re-read the live store —
         <a href="/blog/rag-index-vs-live-store">the post explains why</a>.
       </li>
