@@ -1,0 +1,206 @@
+---
+title: "What to Embed vs What to Store as Metadata"
+tagline: "Every field in your indexed document is a choice. Getting it wrong in either direction causes real bugs. Here are the two tests I use to make the decision."
+date: 2026-04-24
+tags: ["rag", "architecture", "debugging"]
+readTime: 7
+series: "Incident RAG in Production"
+seriesPart: 3
+seeAlso: ["rag-boilerplate-dominance", "rag-metadata-dedup"]
+---
+
+*Part of a series on building and debugging RAG systems on a real production codebase. Earlier posts covered embedding intuition, boilerplate dominance, and deduplication bugs. This post answers a question that came directly from debugging those issues: how do you decide what goes in the embedded text vs what goes in metadata?*
+
+---
+
+## Every field is a choice
+
+When you index a document into a vector database, you make a decision for every field: does this go in the embedded text, or does it go in metadata?
+
+Most tutorials skip this decision entirely. They show you a simple example — embed the whole document, done — and move on. In production, that's where the bugs start.
+
+Getting this wrong in either direction causes real problems:
+
+- **Too much in embedded text**: fields that vary between occurrences of the same document dilute similarity scores. Dedup breaks. Unrelated documents look similar because they share lifecycle boilerplate.
+- **Too much in metadata**: fields that help identify a document get excluded from the search signal. Recall drops. The right document doesn't come back.
+
+This post gives you the two tests I use to make the decision, grounded in what your vector database actually does with each field.
+
+---
+
+## What the database actually stores
+
+Before the tests, it helps to understand what the database holds for each document. In my system there are two backends — ChromaDB locally, pgvector in production — but they store the same four things:
+
+ChromaDB (local dev):
+
+```
+id          → string identifier
+document    → the raw text that was embedded
+embeddings  → the 1536-dimensional vector from text-embedding-3-small
+metadatas   → a dict of key/value pairs, persisted to disk
+```
+
+pgvector (production):
+
+```sql
+CREATE TABLE vec_incidents (
+    id        VARCHAR  PRIMARY KEY,
+    document  TEXT,                  -- the raw text
+    meta      JSONB,                 -- the metadata dict
+    embedding vector(1536)           -- the vector
+);
+```
+
+Every search result returns all four: the id, the document text, the metadata dict, and the cosine similarity score.
+
+**The critical point: only the embedding participates in scoring.** The embedding is computed once from `document` at index time and never changes. `meta` is stored alongside it but plays no role in cosine similarity — it's just a payload that rides along with every result.
+
+This means:
+- Anything you put in `document` affects which results come back and in what order.
+- Anything you put in `meta` does not affect scoring. It's available after retrieval but invisible to the search.
+
+---
+
+## Test 1: The retrieval test
+
+**Does this field help someone find this document?**
+
+If yes, it belongs in the embedded text.
+
+Ask yourself: if a user queried for this field's content, would you want this document to come back?
+
+**Embed it:**
+- Error message: `TypeError: Cannot read properties of undefined (reading 'host')` — yes, a query for "undefined host property" should find this
+- Root cause: `S3 copy/delete attempted on key that no longer exists` — yes, a query for "missing S3 key" should find this
+- Stack trace function names: `getBrandFtpConfig`, `processImage` — yes, a query for that function name should find this
+
+**Don't embed it:**
+- PR URL: `https://github.com/.../pull/42` — a query for "S3 error" should not match because the PR URL happens to contain "S3"
+- Status: `awaiting_approval` — a query for "approval" should not return incidents just because they're in that state
+- Fix description: `NoSuchKey try/catch added to routes/services/image.js` — debatable, but as the next test shows, it causes problems
+
+---
+
+## Test 2: The stability test
+
+**Could this field differ between two occurrences of the same thing?**
+
+If yes, it belongs in metadata.
+
+This test catches a class of bugs the retrieval test misses. Some fields seem like useful retrieval signal but vary between occurrences of the same underlying document. Embedding them means two documents that should be near-identical end up with lower similarity scores than they should — because the varying field pulls their vectors apart.
+
+The concrete example from my system: four incidents about the same S3 bug, all with different Fix and Outcome fields:
+
+```
+Incident A:  ...| Fix: NoSuchKey try/catch added to routes/services/image.js | Outcome: awaiting_approval
+Incident B:  ...| Fix: FixGenerationAgent raised an exception or the GitHub circuit breaker is open. | Outcome: fix_failed
+Incident C:  ...| Outcome: awaiting_approval
+Incident D:  ...| Fix: NoSuchKey try/catch added to routes/services/image.js | Outcome: awaiting_approval
+```
+
+All four are the same bug. But because Fix and Outcome vary between them, three of six pairwise similarity scores dropped below the 0.90 dedup threshold:
+
+| Pair | Score | Result |
+|---|---|---|
+| A vs B (different Fix text) | 0.83 | slips through |
+| B vs C (Fix present vs absent) | 0.87 | slips through |
+| B vs D (different Fix text) | 0.83 | slips through |
+
+The embedding model isn't wrong. It's doing exactly what it's supposed to: different text produces different vectors. The mistake is that the text included fields that vary across the lifecycle of a single incident.
+
+Ask yourself: if this exact same bug fired again tomorrow, would this field have the same value?
+
+- Error message → yes, same → safe to embed
+- Root cause → yes, same → safe to embed
+- Fix description → no, depends on whether the fix succeeded → metadata
+- Status → no, changes as the incident progresses → metadata
+- PR URL → no, new PR each time → metadata
+- Timestamps → no → metadata
+
+---
+
+## Putting the two tests together
+
+| Field | Retrieval test | Stability test | Decision |
+|---|---|---|---|
+| Error message | Helps find the doc | Same every time | Embed |
+| Root cause | Helps find the doc | Same every time | Embed |
+| Stack trace | Helps for function-name queries | Same every time | Embed |
+| Fix description | Marginally useful | Varies by outcome | Metadata |
+| Status | Not a retrieval signal | Changes over time | Metadata |
+| PR URL | Not a retrieval signal | New each time | Metadata |
+| Error type | Helps (but once is enough) | Same every time | Embed once |
+| Service name | Filterable without embedding | Same every time | Metadata (see below) |
+
+The last row is subtle. Service name passes the stability test — it's the same every time — but it's better in metadata than embedded text.
+
+---
+
+## When metadata is better even for stable fields
+
+Service name (`TaskAllInterviews`) is stable. But embedding it causes the boilerplate dominance problem covered in Part 1: every document in the corpus has the same service name, so every document's vector gets pulled toward that shared token. Unrelated errors from the same service look more similar than they should.
+
+The solution: put service name in metadata and use it for filtering instead of embedding. In pgvector, the `meta` column is JSONB, which means you can filter before the vector search:
+
+```sql
+-- Instead of hoping "TaskAllInterviews" in the embedded text helps,
+-- filter by it directly in SQL
+WHERE meta @> '{"service": "TaskAllInterviews"}'
+ORDER BY embedding <=> $query_vector
+LIMIT 10
+```
+
+You get precise service-scoped search without polluting the embedding signal. Filtering happens at the SQL layer; similarity scoring happens at the vector layer. Each does what it's good at.
+
+This generalises: any field that's categorical and filterable is often better in metadata than embedded text — even if it's stable. Error type is the borderline case: including it once as a prefix (`TYPEERROR: ...`) adds useful disambiguation without being repeated enough to dominate.
+
+---
+
+## The mental model
+
+Think of a document in your vector database as having two zones:
+
+**The fingerprint zone (embedded text)** — what makes this document uniquely findable. Should be:
+- The most differentiating content
+- Stable across all occurrences of the same underlying thing
+- Present once — no repetition
+
+**The case file zone (metadata)** — everything you want to read after you've already found the document. Should include:
+- Lifecycle fields that change over time
+- Structured fields you want to filter on
+- Fields that are the same across many documents (service, category)
+
+The fingerprint gets the document found. The case file tells you what to do with it once it's found.
+
+---
+
+## How this plays out end-to-end in my system
+
+My incident vector store now separates the two zones cleanly:
+
+```python
+# Fingerprint — drives cosine similarity, used for dedup
+text = (
+    f"{incident.error_event.error_type}: {incident.error_event.description[:300]} | "
+    f"Root cause: {incident.diagnosis}"
+)
+
+# Case file — returned with results, visible to the LLM, not scored
+metadata = {
+    "incident_id":     incident.id,
+    "status":          incident.status.value,            # lifecycle
+    "error_type":      incident.error_event.error_type,  # filterable
+    "service":         incident.error_event.service,     # filterable
+    "pr_url":          incident.pr_url or "",            # lifecycle
+    "fix_description": (incident.fix_description or "")[:200],  # lifecycle
+}
+```
+
+The dedup gate compares fingerprints — error + root cause only. The LLM context string reads the case file — fix description, status, PR URL surfaced explicitly after retrieval.
+
+Two paths, two purposes, one database.
+
+---
+
+*Next: Part 4 — building a recall@3 eval harness so every future RAG change has a measurable before/after number.*

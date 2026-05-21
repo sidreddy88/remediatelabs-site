@@ -1,0 +1,244 @@
+---
+title: "The Deduplication Bug Hidden in Your Metadata"
+tagline: "My RAG dedup gate was silently letting duplicates through. The embedded text looked right. The scores looked wrong. The bug was in what I was putting into the vectors."
+date: 2026-04-17
+tags: ["rag", "debugging", "architecture"]
+readTime: 7
+series: "Incident RAG in Production"
+seriesPart: 2
+seeAlso: ["rag-dedup-failure", "rag-index-vs-live-store"]
+---
+
+*Part of a series on building and debugging RAG systems on a real production codebase. Part 1 covered boilerplate dominance — when repeated words dilute your embedding signal. This post is about a subtler bug: outcome metadata polluting the embedding signal and silently breaking deduplication.*
+
+---
+
+## Two jobs, one vector database
+
+My AI agent platform uses a vector database of past incidents for two completely different purposes. Understanding the difference between them is the foundation of everything in this post.
+
+**Job 1: Dedup scoring**
+
+Before processing a new error, the system asks: have we already handled this bug?
+
+It embeds the incoming error description and runs a cosine similarity search against the incident corpus. If any past incident scores ≥ 0.90, the new event is blocked — it's a duplicate and we don't want to run the same diagnosis and fix again.
+
+This job only cares about bug identity: is this the same underlying problem? The fix status, the PR URL, whether the fix worked — none of that matters. Two incidents are duplicates if they're about the same bug, full stop.
+
+**Job 2: Context retrieval**
+
+When a new incident isn't a duplicate and needs diagnosis, the system asks: what do we know about similar past bugs?
+
+It pulls the top-matching past incidents and builds a context string for the LLM:
+
+```
+Semantically similar past incidents:
+  [0.97] S3_NO_SUCH_KEY: S3 throws NoSuchKey... | Root cause: no existence check
+    Fix: NoSuchKey try/catch added to routes/services/image.js
+    PR: https://github.com/.../pull/42 | Outcome: awaiting_approval
+```
+
+This job cares about bug history: what was the root cause, what fix was attempted, did it succeed or fail. The LLM uses this to decide whether to reuse a known fix, avoid a failed approach, or treat the problem as fresh.
+
+---
+
+## Why this distinction matters
+
+Both jobs query the same vector database. But they need different things from it:
+
+|  | Dedup scoring | Context retrieval |
+|---|---|---|
+| **Question** | Is this the same bug? | What do we know about this bug? |
+| **Needs** | Bug identity only | Bug identity + full history |
+| **Affected by** | Embedded text (determines score) | Embedded text + metadata fields |
+
+The embedded text is what drives cosine similarity. Metadata fields are returned alongside results but don't affect the score.
+
+This means: anything in the embedded text influences dedup. Anything in metadata does not.
+
+If you put outcome fields — fix description, status, outcome — in the embedded text, they affect dedup scoring. Two incidents about the same bug that had different outcomes will score lower similarity than they should. The dedup gate breaks.
+
+That's exactly the bug I found.
+
+---
+
+## The bug: outcome fields in the embedded text
+
+Here's what `index_incident` was building before the fix:
+
+```python
+text = (
+    f"{incident.error_event.error_type}: {incident.error_event.description[:300]} | "
+    f"Root cause: {incident.diagnosis}"
+)
+if incident.fix_description:
+    text += f" | Fix: {incident.fix_description}"    # ← outcome
+text += f" | Outcome: {incident.status.value}"        # ← outcome
+```
+
+The embedded text for each incident contained not just the bug identity, but also what happened to it. A successfully fixed incident and a failed-fix incident about the same bug would produce different strings — and therefore different vectors — just because their outcomes differed.
+
+---
+
+## Seeing the damage in the corpus
+
+My corpus had four incidents all about the same S3 bug: an operation running without an existence check, causing a `NoSuchKey` error when the key had already been deleted.
+
+**Incident A — fix succeeded, awaiting approval**
+
+```
+S3_NO_SUCH_KEY: S3 throws NoSuchKey on missing key |
+Root cause: S3 copy/delete attempted on key that no longer exists — no existence check |
+Fix: NoSuchKey try/catch added to routes/services/image.js |
+Outcome: awaiting_approval
+```
+
+**Incident B — fix generation failed**
+
+```
+S3_NO_SUCH_KEY: S3 throws NoSuchKey on missing key |
+Root cause: S3 copy/delete attempted on key that no longer exists — no existence check |
+Fix: FixGenerationAgent raised an exception or the GitHub circuit breaker is open. |
+Outcome: fix_failed
+```
+
+Same bug. But the fix generation failed here — the GitHub circuit breaker was open when this ran. The Fix field contains a system error message instead of a code description.
+
+**Incident C — diagnosis complete, no fix yet**
+
+```
+S3_NO_SUCH_KEY: S3 throws NoSuchKey on missing key |
+Root cause: S3 copy/delete attempted on key that no longer exists — no existence check |
+Outcome: awaiting_approval
+```
+
+Same bug. No Fix field at all — the incident reached diagnosis but fix generation hasn't run yet.
+
+**Incident D — identical to A**
+
+Same bug, same fix, same outcome as Incident A. A true duplicate.
+
+---
+
+## Measuring the pairwise scores
+
+| Pair | What differs | Score | Dedup result |
+|---|---|---|---|
+| A vs D | Nothing — identical text | 1.0000 | BLOCKED |
+| A vs C | A has a Fix field, C doesn't | 0.9125 | BLOCKED |
+| C vs D | D has a Fix field, C doesn't | 0.9125 | BLOCKED |
+| A vs B | Different Fix text (code vs error message) | 0.8298 | **SLIPS THROUGH** |
+| B vs C | B has long error-message Fix, C has none | 0.8738 | **SLIPS THROUGH** |
+| B vs D | Different Fix text (code vs error message) | 0.8298 | **SLIPS THROUGH** |
+
+Three of six pairs were slipping past the 0.90 threshold. Every failing pair involves Incident B — the one where the Fix field contains a long error message instead of a short code description. That error message pulls Incident B's vector far enough away from the others to drop below threshold.
+
+The embedding model isn't doing anything wrong. It's doing exactly what it's supposed to: strings with different text produce different vectors. The bug is that the text included content that shouldn't be there.
+
+---
+
+## The fix: separate identity from outcome
+
+The embedded text should only contain what identifies the bug. Everything else belongs in metadata.
+
+```python
+# After — text contains only bug identity
+text = (
+    f"{incident.error_event.error_type}: {incident.error_event.description[:300]} | "
+    f"Root cause: {incident.diagnosis}"
+)
+
+# outcome fields moved to metadata
+metadata = {
+    "incident_id":     incident.id,
+    "status":          incident.status.value,
+    "error_type":      incident.error_event.error_type or "",
+    "service":         incident.error_event.service or "",
+    "pr_url":          incident.pr_url or "",
+    "fix_description": (incident.fix_description or "")[:200],  # ← moved here
+}
+```
+
+All four incidents now produce identical indexed text:
+
+```
+S3_NO_SUCH_KEY: S3 throws NoSuchKey on missing key | Root cause: S3 copy/delete attempted on key that no longer exists — no existence check
+```
+
+Identical text → identical embeddings → cosine = 1.0 → all pairs blocked.
+
+| Pair | Before | After |
+|---|---|---|
+| A vs B (different Fix text) | 0.8298 | 1.0000 |
+| B vs C (Fix present vs absent) | 0.8738 | 1.0000 |
+| B vs D (different Fix text) | 0.8298 | 1.0000 |
+| A vs C (Fix present vs absent) | 0.9125 | 1.0000 |
+| C vs D (Fix present vs absent) | 0.9125 | 1.0000 |
+| A vs D (identical) | 1.0000 | 1.0000 |
+
+---
+
+## Closing the gap: keeping fix_description visible to the LLM
+
+Moving `fix_description` to metadata was right for deduplication. But it introduced a new problem: the LLM was no longer seeing what fix had worked.
+
+Previously, `fix_description` appeared in `s['text']` — the embedded document — so it showed up automatically in the context string. After the fix, `s['text']` only contained the error and root cause. The fix description was silently dropped.
+
+Two places needed updating.
+
+First, `search_incidents` needed to return `fix_description` from metadata:
+
+```python
+# rag.py — search_incidents return dict
+{
+    "incident_id":     m.metadata.get("incident_id", m.id),
+    "status":          m.metadata.get("status", ""),
+    "pr_url":          m.metadata.get("pr_url", ""),
+    "fix_description": m.metadata.get("fix_description", ""),   # ← added
+    "text":            m.document,
+    "score":           m.score,
+}
+```
+
+Second, the context-building loop in `incident_loop.py` needed to append it:
+
+```python
+# Before — fix description came from s['text'], now it's gone
+lines.append(
+    f"  [{s['score']:.2f}] {s['text'][:200]}\n"
+    f"    PR: {s['pr_url'] or 'none'} | Outcome: {s['status']}"
+)
+
+# After — explicitly pull fix_description from the metadata field
+fix_line = f" | Fix: {s['fix_description']}" if s.get("fix_description") else ""
+lines.append(
+    f"  [{s['score']:.2f}] {s['text'][:200]}{fix_line}\n"
+    f"    PR: {s['pr_url'] or 'none'} | Outcome: {s['status']}"
+)
+```
+
+The two paths are now cleanly separated:
+
+| Path | Source | Purpose |
+|---|---|---|
+| Dedup scoring | Embedded text only | Determines cosine similarity — bug identity only |
+| LLM context | Embedded text + metadata fields | Full history: what happened, what fix worked |
+
+The dedup gate looks at the fingerprint. The LLM looks at the full case file. Same database, different views of the same data.
+
+---
+
+## The rule
+
+**Embed what identifies the bug. Store everything else as metadata.**
+
+A quick test for any field you're considering adding to indexed text: would this field be the same on two different occurrences of the same bug?
+
+- Error message, root cause, stack trace → yes, same → embed it
+- Fix description, status, outcome, PR URL, timestamps → could differ → metadata
+
+The embedded text is the bug's fingerprint. A fingerprint shouldn't change based on whether the bug was fixed last Tuesday or is still open today.
+
+---
+
+*Next: Part 3 — building a recall@3 eval harness so that every future RAG change produces a measurable before/after number instead of just "it feels better."*
