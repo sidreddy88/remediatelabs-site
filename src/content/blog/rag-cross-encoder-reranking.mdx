@@ -21,7 +21,7 @@ Here's why that distinction matters, and what it costs.
 
 ## The problem vector search can't solve alone
 
-After five posts of fixes, my RAG pipeline was working well. The eval harness was passing 8/8. Retrieval scores were reasonable.
+After five posts of fixes, my RAG pipeline was working well on the four production-length queries I introduced at the end of Part 5 — all returned the correct incident at rank 1. The eval harness was passing 8/8. Retrieval scores were reasonable.
 
 But there was a persistent issue I couldn't fix by tuning the indexed text: vector scores are compressed.
 
