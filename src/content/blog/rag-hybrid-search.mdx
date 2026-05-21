@@ -215,6 +215,29 @@ Two rank improvements, two score lifts. The queries that were already correct go
 
 ---
 
+## Testing on production-length queries
+
+The four queries above are exact identifiers — the case hybrid is designed for. In production, queries are longer and more descriptive. An incident response agent doesn't query for `classifyFields`; it queries for something like `classifyFields json parse error openai` based on the full error context.
+
+I ran the same hybrid pipeline on four production-length queries that will carry through the rest of this series:
+
+| Query | Vec rank | Vec score | Hybrid rank | Hybrid score |
+|---|---|---|---|---|
+| classifyFields json parse error openai | 1 | 0.56 | 1 | 0.69 |
+| publish_decision undefined classification | 1 | 0.51 | 1 | 0.56 |
+| S3 NoSuchKey copy delete missing key | 1 | 0.79 | 1 | 0.80 |
+| file not found when copying object in S3 | 1 | 0.52 | **2** | **0.51** |
+
+Three of four: no rank change, modest score lift from the lexical signal reinforcing the vector result. The fourth is the exception worth examining.
+
+For `file not found when copying object in S3`, vector search ranks the `S3_NO_SUCH_KEY` incident first — the embedding model correctly maps "file not found in S3 context" to the NoSuchKey error. Hybrid moves a different incident, `FILE_NOT_FOUND` (an ENOENT error during upload), to rank 1. It scores higher on the lexical pass because it literally contains "file", "not", "found", and "copying" as exact tokens.
+
+This is the "hybrid actively hurts" failure mode made concrete. Hybrid can't distinguish between "tokens present because the document is about the right thing" and "tokens present because this document happens to use the same words." The `S3_NO_SUCH_KEY` incident is the right answer — `copyObject` throwing `NoSuchKey` when the source key doesn't exist is exactly "a file not found when copying an S3 object." The ENOENT incident is a different root cause entirely.
+
+Tuning alpha won't fix this. What's needed is a relevance signal that sees query and document together and understands their relationship — not just whether their tokens overlap. That's Part 6.
+
+---
+
 ## When hybrid helps and when it doesn't
 
 **Hybrid helps when:**
@@ -235,4 +258,4 @@ The right mental model: semantic search for recall, lexical for precision on ide
 
 ---
 
-*Next: Part 6 — cross-encoder re-ranking: why two-stage retrieval (vector for recall, cross-encoder for precision) is the right architecture for production RAG.*
+*Next: Part 6 — cross-encoder re-ranking. Same four production queries, same corpus. Rankings are already correct after our fixes; the question is whether the scores are calibrated well enough to act on.*
