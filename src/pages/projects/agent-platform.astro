@@ -18,9 +18,9 @@ const pipelineChart = `flowchart TB
     H -- pass --> I[CodeReviewAgent<br/>self-critique]
     I --> J[Open GitHub PR]
     J --> K{Risk}
-    K -- LOW/MED --> M[Auto-merge]
-    K -- HIGH/CRIT --> L[Human approval]
-    L --> M
+    K -- LOW/MED --> L[Human approval]
+    K -- HIGH/CRIT --> L
+    L --> M[Merge]
     M --> N[MonitorGenerationAgent<br/>new alarms for changed code]
     classDef event fill:#0b0d10,stroke:#2f343b,color:#e6e8eb
     classDef agent fill:#13161a,stroke:#6ee7b7,color:#e6e8eb
@@ -77,8 +77,8 @@ const agents = [
     </h1>
     <p class="text-muted text-lg mt-4 max-w-3xl leading-relaxed">
       A 5-agent pipeline that detects production crashes, grounds the diagnosis against the actual
-      repo, generates a patch, validates it in a Docker sandbox, and opens a PR — fully automated
-      for LOW/MEDIUM severity, with a human approval gate for anything HIGH/CRITICAL.
+      repo, generates a patch, validates it in a Docker sandbox, and opens a PR — with a human
+      approval gate before any merge, escalating urgency for HIGH/CRITICAL severity.
     </p>
     <div class="flex flex-col sm:flex-row gap-3 mt-8">
       <DemoCTA />
@@ -200,8 +200,8 @@ const agents = [
         opening any GitHub noise.
       </li>
       <li>
-        <strong class="text-ink">Approval gate for HIGH/CRITICAL.</strong> Configurable
-        risk threshold; rejections are logged as RLHF preference pairs.
+        <strong class="text-ink">Approval gate before every merge.</strong> All PRs require
+        human approval; HIGH/CRITICAL incidents escalate immediately. Rejections are logged as RLHF preference pairs.
       </li>
     </ol>
   </section>
