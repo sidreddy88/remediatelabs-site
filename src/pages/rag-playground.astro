@@ -606,6 +606,7 @@ function renderResults(results) {
           <div class="flex items-center gap-2 mb-1">
             <span class="font-mono text-sm ${isTarget ? 'text-accent font-semibold' : 'text-ink'}">${r.chunk.name}</span>
             ${isTarget ? '<span class="text-xs bg-accent/10 text-accent border border-accent/30 px-1.5 py-0.5 rounded">target</span>' : ''}
+            <span class="text-xs font-mono text-muted ml-auto">rank ${r.rank}</span>
           </div>
           ${scoreBreakdown}
           <div class="mt-2 score-bar-bg">
