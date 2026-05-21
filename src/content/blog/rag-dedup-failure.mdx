@@ -25,7 +25,7 @@ When a production error arrives, before any expensive work happens, the pipeline
 
 ```
 Layer 1  →  String match against open incidents     — hard block
-Layer 2  →  SQL lookup for resolved incidents       — soft: regression context
+Layer 2  →  Postgres lookup for resolved incidents       — soft: regression context
 Layer 3  →  RAG semantic search                     — soft: context for TriageAgent
 ```
 
@@ -177,7 +177,7 @@ This is what makes compound failures hard to debug. You can read the code for an
   chart={`flowchart TB
     Event([Incoming error event]) --> L1{Layer 1<br/>string match<br/>whitespace-collapsed}
     L1 -- match --> Drop1([drop · zero API cost])
-    L1 -- miss --> L2[Layer 2<br/>SQL resolved lookup]
+    L1 -- miss --> L2[Layer 2<br/>Postgres resolved lookup]
     L2 -- regression found --> Ctx1[Soft: regression context<br/>for TriageAgent]
     L2 -- nothing --> L3
     Ctx1 --> L3
