@@ -13,7 +13,7 @@ import Mermaid from "../../components/Mermaid.astro";
 
 I built a deduplication pipeline to prevent my incident remediation system from processing the same error twice. Three layers of checks. The design looked solid on paper.
 
-The same `TypeError: Cannot read properties of undefined (reading 'publish_decision')` created a brand new incident, ran full triage, diagnosis, and fix generation — complete API cost, complete pipeline — despite an existing open incident already having a PR open for the exact same error.
+The same `TypeError: Cannot read properties of undefined (reading 'publish_decision')` created a brand new incident on the production cluster, ran full triage, diagnosis, and fix generation — complete API cost, complete pipeline — despite an existing open incident already having a PR open for the exact same error.
 
 All three layers failed simultaneously. Here's why.
 
@@ -129,14 +129,14 @@ for s in _rag_similar:
 Three design decisions baked into this:
 
 - **Unconditional**: not gated on `prior_context is None`
-- **Live store lookup**: ignores ChromaDB metadata, reads current status directly
+- **Live store lookup**: ignores pgvector metadata, reads current status directly from Postgres
 - **Higher threshold (0.90 vs 0.80)**: hard blocks should only fire on near-identical matches
 
 ---
 
-## Failure Point 4: ChromaDB Metadata Goes Stale
+## Failure Point 4: Vector Index Metadata Goes Stale
 
-The live store lookup in the fix above is deliberate. Using `s["status"]` from ChromaDB would have been wrong.
+The live store lookup in the fix above is deliberate. Using `s["status"]` from pgvector metadata would have been wrong.
 
 RAG stores metadata at index time:
 
@@ -148,9 +148,9 @@ metadatas=[{
 }]
 ```
 
-An incident is only re-indexed when it resolves. During its lifetime — `TRIAGING` → `FIXING` → `REVIEWING` → `AWAITING_APPROVAL` → `AWAITING_REFIX_APPROVAL` — the metadata in ChromaDB reflects whatever state it was in when last indexed. For an incident currently `AWAITING_REFIX_APPROVAL`, ChromaDB might have it stored as `TRIAGING` or not indexed at all.
+An incident is only re-indexed when it resolves. During its lifetime — `TRIAGING` → `FIXING` → `REVIEWING` → `AWAITING_APPROVAL` → `AWAITING_REFIX_APPROVAL` — the metadata in pgvector reflects whatever state the incident was in when last indexed. For an incident currently `AWAITING_REFIX_APPROVAL`, pgvector might have it stored as `TRIAGING` or not indexed at all.
 
-If the blocking logic had used `s["status"]` to determine whether an incident was still open, it would have been making a blocking decision based on a stale snapshot. An incident that was `TRIAGING` two days ago might be resolved now. Or open but in a state ChromaDB has never seen.
+If the blocking logic had used `s["status"]` to determine whether an incident was still open, it would have been making a blocking decision based on a stale snapshot. An incident that was `TRIAGING` two days ago might be resolved now. Or open but in a state the index has never seen.
 
 **The live store is the only authoritative source of current status.** RAG is for finding candidates. The live store confirms their current state. These are two different jobs and they should never be conflated.
 
@@ -194,7 +194,7 @@ This is what makes compound failures hard to debug. You can read the code for an
     class Event,Drop1,Drop2,Triage event
     class L1,L3 hard
     class L2,L3b,Ctx1,Live soft`}
-  caption="The dedup pipeline after all four fixes. Layer 1 catches the common case with zero API cost. Layer 3 runs unconditionally and reads the live store — it cannot be fooled by stale ChromaDB metadata."
+  caption="The dedup pipeline after all four fixes. Layer 1 catches the common case with zero API cost. Layer 3 runs unconditionally and reads Postgres directly — it cannot be fooled by stale vector index metadata."
 />
 
 Layer 1 catches the common case with zero API cost. Layer 3 is the fallback for formatting differences that slip past Layer 1. Layer 3 cannot be fooled by stale metadata because it always reads live status.
@@ -205,7 +205,7 @@ Layer 1 catches the common case with zero API cost. Layer 3 is the fallback for 
 
 **Soft and hard are different categories.** Injecting context into an LLM prompt and expecting it to reliably produce a specific output is a soft mechanism. If you need a hard guarantee — event dropped, action blocked, duplicate rejected — implement it deterministically. Don't use "the LLM will probably do the right thing" where you need a circuit breaker.
 
-**RAG metadata goes stale.** ChromaDB stores what you give it at index time. If the underlying record changes after indexing, the metadata is wrong. For any decision that depends on current state — is this incident still open? does this PR still exist? — query the live store. Use RAG to find candidates, not to confirm current truth.
+**RAG metadata goes stale.** The vector index stores what you give it at index time. If the underlying record changes after indexing, the metadata is wrong. For any decision that depends on current state — is this incident still open? does this PR still exist? — query Postgres directly. Use RAG to find candidates, not to confirm current truth.
 
 **Layer ordering creates invisible dependencies.** When Layer N gates Layer N+1, you've created a coupling that isn't visible from reading either layer in isolation. The short-circuit made sense as a cost optimization. The side effect — that RAG could never fire when a regression was detected — was invisible until a specific combination of conditions exposed it. Document gating logic explicitly and ask what scenarios it prevents downstream layers from running.
 
