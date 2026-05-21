@@ -206,5 +206,3 @@ A real production code RAG pipeline needs both:
 The order matters. Don't add LLM-generated descriptions on top of line-based chunks — the dilution problem will swamp the description signal. Fix chunking first, then enrich.
 
 ---
-
-*This post completes the four-exercise Code RAG series. Starting from a line-count chunker that split functions across arbitrary 50-line windows, we built: structural diagnosis of two distinct failure modes, function-boundary extraction that eliminates dilution, and LLM-generated descriptions that partially close the vocabulary gap. Every change was measured.*

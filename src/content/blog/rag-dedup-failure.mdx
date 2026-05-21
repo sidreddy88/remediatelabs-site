@@ -136,23 +136,9 @@ Three design decisions baked into this:
 
 ## Failure Point 4: Vector Index Metadata Goes Stale
 
-The live store lookup in the fix above is deliberate. Using `s["status"]` from pgvector metadata would have been wrong.
+The live store lookup in the fix above is deliberate. pgvector stores `status` and `pr_url` as metadata at index time and doesn't update them as the incident moves through its lifecycle. Using `s["status"]` from the search result would mean making a blocking decision based on a snapshot that could be many state transitions out of date.
 
-RAG stores metadata at index time:
-
-```python
-metadatas=[{
-    "incident_id": incident.id,
-    "status": incident.status.value,   # snapshot at index time
-    "pr_url": incident.pr_url or "",   # snapshot at index time
-}]
-```
-
-An incident is only re-indexed when it resolves. During its lifetime — `TRIAGING` → `FIXING` → `REVIEWING` → `AWAITING_APPROVAL` → `AWAITING_REFIX_APPROVAL` — the metadata in pgvector reflects whatever state the incident was in when last indexed. For an incident currently `AWAITING_REFIX_APPROVAL`, pgvector might have it stored as `TRIAGING` or not indexed at all.
-
-If the blocking logic had used `s["status"]` to determine whether an incident was still open, it would have been making a blocking decision based on a stale snapshot. An incident that was `TRIAGING` two days ago might be resolved now. Or open but in a state the index has never seen.
-
-**The live store is the only authoritative source of current status.** RAG is for finding candidates. The live store confirms their current state. These are two different jobs and they should never be conflated.
+The full explanation of why this is a category error — and the general rule for any vector index sitting in front of a live data store — is in [RAG Finds the Candidate. The Live Store Confirms the Truth.](/blog/rag-index-vs-live-store).
 
 ---
 
