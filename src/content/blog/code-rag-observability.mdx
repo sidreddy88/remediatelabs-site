@@ -1,17 +1,162 @@
 ---
-title: "Observability and Retrieval Tracing"
-tagline: "Production RAG systems fail in ways that look like LLM hallucinations but are actually retrieval problems. Without chunk-level tracing, you cannot tell the difference."
+title: "Testing and Observability for Code RAG"
+tagline: "Two ways to know your RAG is working: a recall harness you run before you ship, and chunk-level tracing that shows what actually retrieved in production. Neither replaces the other."
 date: 2026-05-19
-tags: ["rag", "architecture", "debugging"]
-readTime: 9
+tags: ["rag", "architecture", "debugging", "testing"]
+readTime: 14
 series: "Code RAG in Production"
 seriesPart: 10
 seeAlso: ["code-rag-alias-deployment"]
 ---
 
-*Part 10 of the Code RAG series. Parts 1–9 built a pipeline that indexes correctly, retrieves relevantly, and rebuilds safely. This post covers the failure mode that none of that prevents: answers that are wrong in ways you cannot see.*
+*Part 10 of the Code RAG series. Parts 1–9 built a pipeline that indexes correctly, retrieves relevantly, and rebuilds safely. This post covers verification: an offline recall harness you run before shipping any change, and production tracing that shows what's actually happening at query time.*
 
 ---
+
+## The two verification problems
+
+Building a RAG pipeline well is not enough. You also need to know it's working — and there are two distinct moments when it can fail silently:
+
+**Before you ship**: a change to chunking, indexed text, embedding model, or retrieval parameters improved some queries and broke others. Without a test suite, you won't know until a user reports a wrong answer.
+
+**After you ship**: a query returns the wrong chunks. The LLM faithfully reasons over that wrong context and produces a confident but incorrect answer. Without chunk-level tracing, this looks identical to an LLM hallucination from the outside.
+
+These are different failure modes with different tools. The first half of this post covers the offline eval harness — a pytest suite you run before every change. The second half covers production tracing.
+
+---
+
+## Offline: building a recall@k eval harness
+
+The metric is **recall@3**: for a given query, is the correct chunk anywhere in the top 3 results? Not rank 1 — rank 1 is too strict for a system that passes all three results to an LLM. If the right chunk is in the top 3, the model has the information it needs.
+
+Recall@3 = (queries where correct chunk is in top 3) / (total queries)
+
+Binary per test case. Either the chunk is there or it isn't. No threshold guessing, no partial credit. Regressions are immediately visible.
+
+### Inspecting the corpus first
+
+Before writing test cases, list what's actually indexed:
+
+```python
+results = collection.get(include=["documents", "metadatas"])
+for chunk_id, doc, meta in zip(results["ids"], results["documents"], results["metadatas"]):
+    print(f"{meta['file_path']}::{meta.get('function_name', '?')}  ({meta['start_line']}–{meta['end_line']})")
+```
+
+Test targets should come from this list, not from memory. The function you think is in the index might not be — or it might be split across two chunks.
+
+### Three query angles per function
+
+For each target function, write queries from three angles:
+
+**Angle 1 — Exact identifier.** The function name verbatim. The easiest case: the token appears literally in the indexed chunk.
+
+**Angle 2 — Paraphrase.** What the function does in plain language, without the name. Tests whether the embedding model captures intent, not just identifier presence.
+
+**Angle 3 — Root cause / error context.** The language a diagnosis agent uses when it arrives with a theory. No function name — just symptoms. From Part 2 we know this is the hardest case: code RAG has a vocabulary gap between what the function does and what it can fail with. If this angle passes, the indexed text enrichment from Part 4 is working.
+
+### The full test suite
+
+```python
+import pytest
+from app.services.rag import CodeRAGService
+
+# Canonical functions — stable reference points for assertions
+MOVE_REMOVE_S3  = "moveAndRemoveFileFromS3"   # routes/services/image.js
+CLASSIFY_FIELDS = "classifyFields"             # app/constants/prankCheckerOpenAI.js
+RUN_PRANK       = "runPrankChecker"            # app/constants/prankCheckerOpenAI.js
+
+
+@pytest.fixture(scope="module")
+def rag():
+    svc = CodeRAGService()
+    yield svc
+
+
+def top3_functions(results):
+    return {r.get("function_name", "") for r in results[:3]}
+
+
+# --- moveAndRemoveFileFromS3 ---
+
+def test_s3_exact_identifier(rag):
+    results = rag.search("moveAndRemoveFileFromS3", n_results=3)
+    assert MOVE_REMOVE_S3 in top3_functions(results)
+
+def test_s3_paraphrase(rag):
+    results = rag.search("copy S3 object to new key then delete the source", n_results=3)
+    assert MOVE_REMOVE_S3 in top3_functions(results)
+
+def test_s3_root_cause(rag):
+    # Hardest: no function name, only error vocabulary
+    # Passes only if indexed text includes enriched error context from Part 4
+    results = rag.search("S3 operation missing key existence check before copy", n_results=3)
+    assert MOVE_REMOVE_S3 in top3_functions(results)
+
+
+# --- classifyFields ---
+
+def test_classify_exact_identifier(rag):
+    results = rag.search("classifyFields", n_results=3)
+    assert CLASSIFY_FIELDS in top3_functions(results)
+
+def test_classify_paraphrase(rag):
+    results = rag.search("parse openai response as JSON object", n_results=3)
+    assert CLASSIFY_FIELDS in top3_functions(results)
+
+def test_classify_root_cause(rag):
+    results = rag.search("LLM response not formatted as JSON causes parse error", n_results=3)
+    assert CLASSIFY_FIELDS in top3_functions(results)
+
+
+# --- Precision ---
+
+def test_s3_query_does_not_return_classify(rag):
+    results = rag.search("S3 copyObject deleteObject bucket key", n_results=3)
+    assert CLASSIFY_FIELDS not in top3_functions(results)
+
+def test_classify_query_does_not_return_s3(rag):
+    results = rag.search("JSON parse error from language model", n_results=3)
+    assert MOVE_REMOVE_S3 not in top3_functions(results)
+
+
+# --- Noise floor ---
+
+def test_unrelated_query_low_score(rag):
+    results = rag.search("OAuth token refresh middleware", n_results=3, min_score=0.0)
+    if results:
+        assert results[0]["score"] < 0.55, f"Noise floor too high: {results[0]['score']}"
+```
+
+### Baseline and regression use
+
+Run this before and after every change to chunking, indexed text, or retrieval parameters:
+
+```
+pytest tests/test_code_rag_recall.py -v
+
+test_s3_exact_identifier               PASSED
+test_s3_paraphrase                     PASSED
+test_s3_root_cause                     PASSED
+test_classify_exact_identifier         PASSED
+test_classify_paraphrase               PASSED
+test_classify_root_cause               PASSED
+test_s3_query_does_not_return_classify PASSED
+test_classify_query_does_not_return_s3 PASSED
+test_unrelated_query_low_score         PASSED
+
+9 passed in 4.1s
+```
+
+A drop from 9/9 to 8/9 after a change tells you exactly which query angle broke. `test_s3_root_cause` is the most valuable — if it's the one that keeps failing, the vocabulary enrichment from Part 4 needs more coverage of the error vocabulary, not just the function description.
+
+The suite doesn't need to be large. Nine test cases covering two functions and a noise floor check is enough to catch most regressions. Add cases as new functions become important to retrieval quality.
+
+---
+
+## Online: production tracing
+
+The eval harness tells you retrieval was working when you shipped. It can't tell you what's happening to a specific production query right now. That requires instrumentation.
 
 ## The invisible failure
 
@@ -32,7 +177,7 @@ System:  "You can reset your API key by navigating to Settings → Security
 
 From the outside, this looks like a hallucination. With retrieval tracing, you open the trace, see that the top chunk came from `docs/v1/api-keys.md` last indexed 4 months ago, and the diagnosis takes 30 seconds.
 
-The standard observability stack — traces, metrics, logs via OpenTelemetry — applies here, but a RAG pipeline has primitives that OTel's generic span model does not capture natively. Similarity scores, chunk provenance, index versions, and reranking decisions need to be instrumented explicitly. This post covers how.
+The standard observability stack — traces, metrics, logs via OpenTelemetry — applies here, but a RAG pipeline has primitives that OTel's generic span model does not capture natively. Similarity scores, chunk provenance, index versions, and reranking decisions need to be instrumented explicitly.
 
 ---
 
@@ -289,4 +434,4 @@ Alert on `eval.faithfulness` p50 dropping below your acceptable floor — for co
 
 ---
 
-*This post completes the ten-part Code RAG series. Starting from a line-count chunker that split functions across arbitrary windows, we built: structural diagnosis of two failure modes, function-boundary extraction, LLM-generated descriptions, hybrid search, cross-encoder re-ranking, a document registry, three-way decision logic for re-chunking vs re-embedding vs re-indexing, alias-based zero-downtime rebuilds, and end-to-end retrieval tracing. Every change was measured against real code from a production codebase.*
+*This post completes the ten-part Code RAG series. Starting from a line-count chunker that split functions across arbitrary windows, we built: structural diagnosis of two failure modes, function-boundary extraction, LLM-generated descriptions, hybrid search, cross-encoder re-ranking, a document registry, three-way decision logic for re-chunking vs re-embedding vs re-indexing, alias-based zero-downtime rebuilds, and end-to-end testing and observability. Every change was measured against real code from a production codebase.*
