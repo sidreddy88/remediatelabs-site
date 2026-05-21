@@ -1,0 +1,834 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+---
+
+<BaseLayout
+  title="RAG Playground — Remediate Labs"
+  description="Interactive explorer for Code RAG and Incident RAG pipeline stages. Toggle function-boundary chunks, LLM descriptions, hybrid search, and cross-encoder re-ranking."
+>
+  <div class="min-h-screen bg-bg">
+    <!-- header -->
+    <div class="border-b border-border px-6 py-4 flex items-center justify-between">
+      <div>
+        <h1 class="text-lg font-semibold text-ink">RAG Pipeline Playground</h1>
+        <p class="text-sm text-muted mt-0.5">Toggle techniques and see how rankings change in real time</p>
+      </div>
+      <!-- series tabs -->
+      <div class="flex gap-1 bg-surface rounded-lg p-1 border border-border">
+        <button id="tab-code" class="tab-btn active px-4 py-1.5 rounded-md text-sm font-medium transition-colors">Code RAG</button>
+        <button id="tab-incident" class="tab-btn px-4 py-1.5 rounded-md text-sm font-medium transition-colors">Incident RAG</button>
+      </div>
+    </div>
+
+    <div class="flex" style="height: calc(100vh - 65px)">
+      <!-- left sidebar -->
+      <aside class="w-72 shrink-0 border-r border-border flex flex-col overflow-y-auto">
+
+        <!-- query selector -->
+        <div class="p-5 border-b border-border">
+          <p class="text-xs font-mono text-muted uppercase tracking-wider mb-3">Query</p>
+          <div id="query-buttons" class="space-y-1.5"></div>
+        </div>
+
+        <!-- pipeline toggles -->
+        <div class="p-5 border-b border-border">
+          <p class="text-xs font-mono text-muted uppercase tracking-wider mb-3">Pipeline Stages</p>
+          <div class="space-y-3" id="toggle-panel"></div>
+        </div>
+
+        <!-- score formula -->
+        <div class="p-5 flex-1">
+          <p class="text-xs font-mono text-muted uppercase tracking-wider mb-3">Score Formula</p>
+          <div id="formula-box" class="bg-surface rounded-lg border border-border p-3 font-mono text-xs text-muted leading-relaxed"></div>
+        </div>
+      </aside>
+
+      <!-- main results panel -->
+      <main class="flex-1 overflow-y-auto p-6">
+        <!-- pipeline breadcrumb -->
+        <div id="pipeline-bar" class="flex items-center gap-2 mb-6 flex-wrap"></div>
+
+        <!-- results -->
+        <div id="results-list" class="space-y-2.5"></div>
+      </main>
+
+      <!-- chunk preview panel -->
+      <aside id="preview-panel" class="w-80 shrink-0 border-l border-border hidden flex-col overflow-y-auto">
+        <div class="p-4 border-b border-border flex items-center justify-between">
+          <p class="text-sm font-medium text-ink" id="preview-title">Chunk preview</p>
+          <button id="close-preview" class="text-muted hover:text-ink text-lg leading-none">×</button>
+        </div>
+        <div class="p-4 font-mono text-xs overflow-auto" id="preview-content"></div>
+      </aside>
+    </div>
+  </div>
+</BaseLayout>
+
+<style>
+  .tab-btn { color: #9aa1a9; }
+  .tab-btn.active { background: #23272d; color: #e6e8eb; }
+  .toggle-row { cursor: pointer; }
+  .toggle-row:hover .toggle-label { color: #e6e8eb; }
+  .toggle-switch {
+    width: 36px; height: 20px; border-radius: 10px;
+    background: #23272d; border: 1px solid #23272d;
+    position: relative; transition: background 0.15s;
+    flex-shrink: 0;
+  }
+  .toggle-switch.on { background: #6ee7b7; border-color: #6ee7b7; }
+  .toggle-switch::after {
+    content: ''; position: absolute; top: 2px; left: 2px;
+    width: 14px; height: 14px; border-radius: 50%;
+    background: #9aa1a9; transition: transform 0.15s, background 0.15s;
+  }
+  .toggle-switch.on::after { transform: translateX(16px); background: #0b0d10; }
+  .result-row {
+    border: 1px solid #23272d; border-radius: 10px;
+    background: #13161a; transition: border-color 0.15s;
+  }
+  .result-row.target { border-color: #0f7a4f; }
+  .result-row.target-rank1 { border-color: #6ee7b7; }
+  .result-row:hover { border-color: #6ee7b7; cursor: pointer; }
+  .rank-badge {
+    width: 28px; height: 28px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 12px; font-weight: 600; flex-shrink: 0;
+  }
+  .rank-1 { background: #6ee7b7; color: #0b0d10; }
+  .rank-2 { background: #23272d; color: #e6e8eb; }
+  .rank-3 { background: #23272d; color: #e6e8eb; }
+  .rank-other { background: #13161a; border: 1px solid #23272d; color: #9aa1a9; }
+  .score-bar-bg { background: #23272d; border-radius: 3px; height: 5px; overflow: hidden; }
+  .score-bar-fill { height: 100%; border-radius: 3px; transition: width 0.3s; }
+  .pipe-step { display: flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 6px; font-size: 12px; }
+  .pipe-step.active { background: #0f7a4f; color: #6ee7b7; }
+  .pipe-step.inactive { background: #13161a; border: 1px solid #23272d; color: #9aa1a9; }
+  .pipe-arrow { color: #23272d; font-size: 14px; }
+  @keyframes rankSlide {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .result-row { animation: rankSlide 0.2s ease-out; }
+</style>
+
+<script>
+// ─── DATA ─────────────────────────────────────────────────────────────────────
+
+const CODE_CHUNKS = [
+  {
+    id: 'move',
+    name: 'moveAndRemoveFileFromS3',
+    isTarget: true,
+    file: 's3-helpers.js',
+    linePreview: `// chunk_441.txt — lines 441–490 (s3-helpers.js)
+// [starts mid-function: moveAndRemoveFileFromS3]
+    }).promise();
+    await s3.deleteObject({
+      Bucket: bucketName,
+      Key: sourceKey,
+    }).promise();
+  } catch (err) {
+    if (err.code === 'NoSuchKey') {
+      throw new Error(\`Source key not found\`);
+    }
+    throw err;
+  }
+}
+// [next function starts here]
+async function processImageBatch(images, bucket) {
+  const results = [];
+  for (const img of images) {
+    const obj = await s3.getObject({
+      Bucket: bucket, Key: img.key
+    }).promise();`,
+    fnCode: `async function moveAndRemoveFileFromS3(
+  sourceKey, destKey, bucketName
+) {
+  const s3 = new AWS.S3();
+  try {
+    await s3.copyObject({
+      Bucket: bucketName,
+      CopySource: \`\${bucketName}/\${sourceKey}\`,
+      Key: destKey,
+    }).promise();
+    await s3.deleteObject({
+      Bucket: bucketName,
+      Key: sourceKey,
+    }).promise();
+  } catch (err) {
+    if (err.code === 'NoSuchKey') {
+      throw new Error(\`Source key \${sourceKey} not found\`);
+    }
+    throw err;
+  }
+}`,
+    description: 'Copies an S3 object to a new location using AWS S3 copyObject, then deletes the original with deleteObject. Throws if the source key is missing (NoSuchKey error). Params: sourceKey, destKey, bucketName.',
+  },
+  {
+    id: 'upload',
+    name: 'UploadOriginaltoS3',
+    file: 's3-helpers.js',
+    linePreview: `// chunk_467.txt — lines 467–516 (s3-helpers.js)
+async function UploadOriginaltoS3(imageUrl, bucketName, key) {
+  const s3 = new AWS.S3();
+  const signedUrl = await s3.getSignedUrlPromise('putObject', {
+    Bucket: bucketName, Key: key, Expires: 60,
+  });
+  const response = await fetch(imageUrl);
+  const buffer = await response.buffer();
+  await s3.putObject({
+    Bucket: bucketName,
+    Key: key,
+    Body: buffer,
+  }).promise();
+  return signedUrl;
+}
+// [next function starts here]
+async function resizeForWeb(buffer, maxWidth) {`,
+    fnCode: `async function UploadOriginaltoS3(imageUrl, bucketName, key) {
+  const s3 = new AWS.S3();
+  const signedUrl = await s3.getSignedUrlPromise('putObject', {
+    Bucket: bucketName,
+    Key: key,
+    Expires: 60,
+  });
+  const response = await fetch(imageUrl);
+  const buffer = await response.buffer();
+  await s3.putObject({
+    Bucket: bucketName,
+    Key: key,
+    Body: buffer,
+  }).promise();
+  return signedUrl;
+}`,
+    description: 'Generates a signed S3 URL, fetches the image via HTTP, and uploads the buffer to S3 using putObject. Returns the signed URL for later retrieval. May throw S3 error if bucket or key is invalid.',
+  },
+  {
+    id: 'dimensions',
+    name: 'getImagesDimensions',
+    file: 's3-helpers.js',
+    linePreview: `// chunk_512.txt — lines 512–561 (s3-helpers.js)
+async function getImagesDimensions(imageKeys, bucketName) {
+  const s3 = new AWS.S3();
+  const dimensions = [];
+  for (const key of imageKeys) {
+    const obj = await s3.getObject({
+      Bucket: bucketName, Key: key,
+    }).promise();
+    const meta = await sharp(obj.Body).metadata();
+    dimensions.push({
+      key, width: meta.width, height: meta.height
+    });
+  }
+  return dimensions;
+}
+// [next function starts here]
+async function archiveOldImages(cutoffDate) {`,
+    fnCode: `async function getImagesDimensions(imageKeys, bucketName) {
+  const s3 = new AWS.S3();
+  const dimensions = [];
+  for (const key of imageKeys) {
+    const obj = await s3.getObject({
+      Bucket: bucketName,
+      Key: key,
+    }).promise();
+    const meta = await sharp(obj.Body).metadata();
+    dimensions.push({ key, width: meta.width, height: meta.height });
+  }
+  return dimensions;
+}`,
+    description: 'Fetches images from AWS S3 using getObject and extracts pixel dimensions via sharp metadata. Returns array of {key, width, height}. Throws on missing key or corrupt image data.',
+  },
+  {
+    id: 'fix',
+    name: 'fixFailedCompressedImages',
+    file: 's3-helpers.js',
+    linePreview: `// chunk_558.txt — lines 558–607 (s3-helpers.js)
+async function fixFailedCompressedImages(failedKeys, bucket) {
+  const s3 = new AWS.S3();
+  for (const key of failedKeys) {
+    const obj = await s3.getObject({
+      Bucket: bucket, Key: key
+    }).promise();
+    const compressed = await sharp(obj.Body)
+      .resize(800).jpeg({ quality: 80 }).toBuffer();
+    await s3.putObject({
+      Bucket: bucket,
+      Key: key.replace('.original', '.compressed'),
+      Body: compressed,
+    }).promise();
+  }
+}`,
+    fnCode: `async function fixFailedCompressedImages(failedKeys, bucket) {
+  const s3 = new AWS.S3();
+  for (const key of failedKeys) {
+    const obj = await s3.getObject({
+      Bucket: bucket,
+      Key: key,
+    }).promise();
+    const compressed = await sharp(obj.Body)
+      .resize(800)
+      .jpeg({ quality: 80 })
+      .toBuffer();
+    await s3.putObject({
+      Bucket: bucket,
+      Key: key.replace('.original', '.compressed'),
+      Body: compressed,
+    }).promise();
+  }
+}`,
+    description: 'Re-compresses failed images from S3 using sharp, resizing to 800px width at 80% JPEG quality. Overwrites the original with the fixed version. Throws on S3 getObject or putObject error.',
+  },
+  {
+    id: 'thumbnail',
+    name: 'generateThumbnailAndUploadtoS3',
+    file: 's3-helpers.js',
+    linePreview: `// chunk_601.txt — lines 601–650 (s3-helpers.js)
+async function generateThumbnailAndUploadtoS3(
+  imageBuffer, key, bucketName
+) {
+  const s3 = new AWS.S3();
+  const thumbnail = await sharp(imageBuffer)
+    .resize(150, 150, { fit: 'cover' })
+    .toBuffer();
+  await s3.putObject({
+    Bucket: bucketName,
+    Key: \`thumbnails/\${key}\`,
+    Body: thumbnail,
+    ContentType: 'image/jpeg',
+  }).promise();
+  return \`thumbnails/\${key}\`;
+}`,
+    fnCode: `async function generateThumbnailAndUploadtoS3(
+  imageBuffer, key, bucketName
+) {
+  const s3 = new AWS.S3();
+  const thumbnail = await sharp(imageBuffer)
+    .resize(150, 150, { fit: 'cover' })
+    .toBuffer();
+  await s3.putObject({
+    Bucket: bucketName,
+    Key: \`thumbnails/\${key}\`,
+    Body: thumbnail,
+    ContentType: 'image/jpeg',
+  }).promise();
+  return \`thumbnails/\${key}\`;
+}`,
+    description: 'Generates a 150×150 thumbnail from an image buffer using sharp and uploads it to S3 under a thumbnails/ prefix. Returns the thumbnail key. May throw S3 putObject error.',
+  },
+  {
+    id: 'delete',
+    name: 'deleteFileFromS3',
+    file: 's3-helpers.js',
+    linePreview: `// chunk_648.txt — lines 648–690 (s3-helpers.js)
+async function deleteFileFromS3(key, bucketName) {
+  const s3 = new AWS.S3();
+  try {
+    await s3.deleteObject({
+      Bucket: bucketName,
+      Key: key,
+    }).promise();
+  } catch (err) {
+    if (err.code === 'NoSuchKey') {
+      console.warn(\`Key \${key} already deleted\`);
+      return false;
+    }
+    throw err;
+  }
+  return true;
+}`,
+    fnCode: `async function deleteFileFromS3(key, bucketName) {
+  const s3 = new AWS.S3();
+  try {
+    await s3.deleteObject({
+      Bucket: bucketName,
+      Key: key,
+    }).promise();
+  } catch (err) {
+    if (err.code === 'NoSuchKey') {
+      console.warn(\`Key \${key} already deleted\`);
+      return false;
+    }
+    throw err;
+  }
+  return true;
+}`,
+    description: 'Deletes a single file from S3 by key. Returns false if the key was already deleted (NoSuchKey), true on success. Throws on other S3 errors.',
+  },
+];
+
+// Scores: [vecLine, vecFn, vecEnriched, lexNodesc, lexWithdesc, ceScore]
+// vecEnriched = vecFn + descBoost (desc can help or hurt slightly)
+// hybridScore = 0.7 * vecEnriched + 0.3 * lexWithdesc
+// Documented values from blog posts are marked ✓
+
+const CODE_SCORES = {
+  q1: { // "moveAndRemoveFileFromS3"
+    move:      [0.560, 0.709, 0.675, 1.00, 1.00, +9.81], // ✓ vec stages from blog
+    upload:    [0.390, 0.430, 0.425, 0.25, 0.25, +0.85],
+    dimensions:[0.325, 0.360, 0.355, 0.00, 0.00, -3.20],
+    fix:       [0.300, 0.335, 0.330, 0.00, 0.00, -3.80],
+    thumbnail: [0.305, 0.345, 0.340, 0.25, 0.25, -2.90],
+    delete:    [0.355, 0.395, 0.388, 0.50, 0.50, +1.20],
+  },
+  q2: { // "copy S3 object then delete source"
+    move:      [0.503, 0.572, 0.572, 1.00, 1.00, +9.14], // ✓
+    upload:    [0.420, 0.465, 0.460, 0.40, 0.40, +1.30],
+    dimensions:[0.330, 0.370, 0.365, 0.20, 0.20, -2.80],
+    fix:       [0.310, 0.348, 0.343, 0.20, 0.20, -3.40],
+    thumbnail: [0.315, 0.355, 0.348, 0.40, 0.40, -1.90],
+    delete:    [0.380, 0.425, 0.420, 0.80, 0.80, +2.10],
+  },
+  q3: { // "S3 copyObject deleteObject bucket key"
+    move:      [0.502, 0.597, 0.614, 1.00, 1.00, +9.43], // ✓
+    upload:    [0.410, 0.455, 0.450, 0.20, 0.20, +0.60],
+    dimensions:[0.340, 0.380, 0.375, 0.20, 0.20, -2.50],
+    fix:       [0.315, 0.353, 0.347, 0.20, 0.20, -3.10],
+    thumbnail: [0.320, 0.362, 0.355, 0.20, 0.20, -2.60],
+    delete:    [0.370, 0.415, 0.408, 0.40, 0.40, +1.80],
+  },
+  q4: { // "S3 NoSuchKey missing key error" — the hard one
+    move:      [0.195, 0.248, 0.282, 0.60, 0.80, +8.31], // ✓ enriched=0.282, hybrid vec=0.2824 ✓
+    upload:    [0.210, 0.255, 0.315, 0.40, 0.80, +2.14], // ✓ hybrid vec=0.3146 ✓
+    dimensions:[0.200, 0.245, 0.304, 0.40, 0.80, -1.83], // ✓ hybrid vec=0.3037 ✓
+    fix:       [0.195, 0.242, 0.283, 0.40, 0.80, -2.07], // ✓ hybrid vec=0.2823 ✓
+    thumbnail: [0.192, 0.240, 0.282, 0.40, 0.80, -2.31], // ✓ hybrid vec=0.2818 ✓
+    delete:    [0.215, 0.262, 0.295, 0.60, 0.80, +4.20],
+  },
+};
+
+const CODE_QUERIES = [
+  { id: 'q1', text: 'moveAndRemoveFileFromS3', label: 'Function name', color: 'accent' },
+  { id: 'q2', text: 'copy S3 object then delete source', label: 'Natural language', color: 'accent' },
+  { id: 'q3', text: 'S3 copyObject deleteObject bucket key', label: 'API call names', color: 'accent' },
+  { id: 'q4', text: 'S3 NoSuchKey missing key error', label: 'Incident vocabulary', color: 'accent' },
+];
+
+const CODE_TOGGLES = [
+  { id: 'fn', label: 'Function-boundary chunks', description: 'Isolate each function into its own chunk. Fixes dilution from 50-line windows.' },
+  { id: 'desc', label: 'LLM-generated descriptions', description: 'Append a generated description to each chunk. Adds missing vocabulary (error types, intent).' },
+  { id: 'hybrid', label: 'Hybrid search', description: 'Mix vector + lexical (BM25). Lexical rewards exact token matches like error codes.' },
+  { id: 'ce', label: 'Cross-encoder re-ranking', description: 'Re-score top-20 candidates by running (query, doc) pairs through a cross-encoder model.' },
+];
+
+// ─── INCIDENT RAG DATA ────────────────────────────────────────────────────────
+
+const INCIDENT_CHUNKS = [
+  {
+    id: 'nosuchkey',
+    name: 'S3_NO_SUCH_KEY',
+    isTarget: true,
+    preview: `S3_NO_SUCH_KEY: S3 throws NoSuchKey when attempting
+to copyObject from a source path that no longer exists.
+Root cause: race condition between image deletion job
+and copy pipeline. Bucket: printtool123, region: us-east-2.
+Fix: check object existence before copy, or catch
+NoSuchKey and skip.`,
+  },
+  {
+    id: 'typeerror',
+    name: 'TYPEERROR_CLASSIFY',
+    preview: `TYPEERROR: TypeError: Cannot read properties of
+undefined (reading 'classification'). Thrown in
+classifyFields when OpenAI response is missing the
+expected JSON structure. Root cause: model returned
+plain text instead of JSON. Fix: add JSON parse guard.`,
+  },
+  {
+    id: 'syntaxerror',
+    name: 'SYNTAXERROR_JSON',
+    preview: `SYNTAXERROR: Failed to parse model JSON in
+publish_decision handler. Model output included markdown
+fences around the JSON block. Root cause: prompt did not
+specify raw JSON output. Fix: strip markdown before parse.`,
+  },
+  {
+    id: 'filenotfound',
+    name: 'FILE_NOT_FOUND',
+    preview: `FILE_NOT_FOUND: ENOENT when copying file during
+S3 upload pre-processing step. Temp file deleted before
+upload completed. Root cause: overlapping cleanup cron
+and upload handler. Fix: use exclusive temp paths.`,
+  },
+  {
+    id: 'timeout',
+    name: 'LAMBDA_TIMEOUT',
+    preview: `LAMBDA_TIMEOUT: Function timed out at 30s during
+batch image resize. S3 getObject calls blocking on large
+images. Root cause: no parallel processing. Fix: use
+Promise.all with concurrency limit.`,
+  },
+];
+
+const INCIDENT_SCORES = {
+  q1: { // "classifyFields json parse error openai"
+    nosuchkey:   [0.21, 0.61, +0.18],
+    typeerror:   [0.56, 0.56, +7.37], // vec=0.5613 ✓, ce=+7.37 ✓
+    syntaxerror: [0.62, 0.62, +8.10],
+    filenotfound:[0.18, 0.18, -3.20],
+    timeout:     [0.15, 0.15, -4.10],
+  },
+  q2: { // "publish_decision undefined classification"
+    nosuchkey:   [0.18, 0.18, -2.80],
+    typeerror:   [0.51, 0.51, +7.38], // vec=0.5120 ✓, ce=+7.38 ✓
+    syntaxerror: [0.56, 0.56, +8.20],
+    filenotfound:[0.19, 0.19, -3.10],
+    timeout:     [0.16, 0.16, -4.20],
+  },
+  q3: { // "S3 NoSuchKey copy delete missing key"
+    nosuchkey:   [0.79, 0.79, +7.85], // vec=0.7916 ✓, ce=+7.85 ✓
+    typeerror:   [0.22, 0.22, -2.10],
+    syntaxerror: [0.18, 0.18, -4.30],
+    filenotfound:[0.51, 0.61, +3.20],
+    timeout:     [0.25, 0.25, -1.80],
+  },
+  q4: { // "file not found when copying object in S3"
+    nosuchkey:   [0.52, 0.52, -0.35], // vec=0.5228 ✓, ce=-0.35 ✓ (the interesting case)
+    typeerror:   [0.20, 0.20, -3.10],
+    syntaxerror: [0.16, 0.16, -4.80],
+    filenotfound:[0.60, 0.60, +6.80],
+    timeout:     [0.31, 0.31, +1.20],
+  },
+};
+
+const INCIDENT_QUERIES = [
+  { id: 'q1', text: 'classifyFields json parse error openai', label: 'Classification failure' },
+  { id: 'q2', text: 'publish_decision undefined classification', label: 'Undefined property' },
+  { id: 'q3', text: 'S3 NoSuchKey copy delete missing key', label: 'S3 key error' },
+  { id: 'q4', text: 'file not found when copying object in S3', label: 'Vocabulary mismatch' },
+];
+
+const INCIDENT_TOGGLES = [
+  { id: 'hybrid', label: 'Hybrid search', description: 'Mix vector + BM25 lexical. Rewards exact token matches like error codes and identifiers.' },
+  { id: 'ce', label: 'Cross-encoder re-ranking', description: 'Re-score top-20 candidates with (query, doc) pairs. 30× wider score spread than vector alone.' },
+];
+
+// ─── STATE ────────────────────────────────────────────────────────────────────
+
+let series = 'code';
+let state = {
+  code: { query: 'q4', fn: false, desc: false, hybrid: false, ce: false },
+  incident: { query: 'q3', hybrid: false, ce: false },
+};
+
+// ─── SCORE COMPUTATION ────────────────────────────────────────────────────────
+
+function computeCodeScores() {
+  const s = state.code;
+  const queryScores = CODE_SCORES[s.query];
+  const results = CODE_CHUNKS.map(chunk => {
+    const [vecLine, vecFn, vecEnriched, lexNodesc, lexWithdesc, ceScore] = queryScores[chunk.id];
+
+    const vecScore = s.desc ? vecEnriched : (s.fn ? vecFn : vecLine);
+    const lexScore = s.desc ? lexWithdesc : lexNodesc;
+    const hybridScore = s.hybrid ? (0.7 * vecScore + 0.3 * lexScore) : vecScore;
+    const finalScore = s.ce ? ceScore : hybridScore;
+
+    return {
+      chunk,
+      vecScore,
+      lexScore,
+      hybridScore,
+      ceScore,
+      finalScore,
+      isHybrid: s.hybrid,
+      isCE: s.ce,
+    };
+  });
+
+  results.sort((a, b) => b.finalScore - a.finalScore);
+  results.forEach((r, i) => { r.rank = i + 1; });
+  return results;
+}
+
+function computeIncidentScores() {
+  const s = state.incident;
+  const queryScores = INCIDENT_SCORES[s.query];
+  const results = INCIDENT_CHUNKS.map(chunk => {
+    const [vecScore, hybridVecScore, ceScore] = queryScores[chunk.id];
+    const baseScore = s.hybrid ? (hybridVecScore * 0.7 + 0.2) : vecScore;
+    const finalScore = s.ce ? ceScore : baseScore;
+    return { chunk, vecScore, hybridScore: hybridVecScore, ceScore, finalScore, isCE: s.ce };
+  });
+  results.sort((a, b) => b.finalScore - a.finalScore);
+  results.forEach((r, i) => { r.rank = i + 1; });
+  return results;
+}
+
+// ─── RENDER ───────────────────────────────────────────────────────────────────
+
+function scoreColor(score, isCE) {
+  if (isCE) {
+    if (score > 6) return '#6ee7b7';
+    if (score > 2) return '#86efac';
+    if (score > 0) return '#fbbf24';
+    return '#f87171';
+  }
+  if (score > 0.65) return '#6ee7b7';
+  if (score > 0.45) return '#86efac';
+  if (score > 0.30) return '#fbbf24';
+  return '#f87171';
+}
+
+function fmtScore(score, isCE) {
+  if (isCE) return (score >= 0 ? '+' : '') + score.toFixed(2);
+  return score.toFixed(4);
+}
+
+function barWidth(score, isCE) {
+  if (isCE) return Math.min(100, Math.max(2, (score + 12) / 22 * 100));
+  return Math.min(100, Math.max(2, score * 100));
+}
+
+function renderResults(results) {
+  const el = document.getElementById('results-list');
+  el.innerHTML = '';
+
+  const label = series === 'code'
+    ? (state.code.ce ? 'CE score' : state.code.hybrid ? 'Hybrid score' : 'Vector score')
+    : (state.incident.ce ? 'CE score' : state.incident.hybrid ? 'Hybrid score' : 'Vector score');
+
+  const isCE = series === 'code' ? state.code.ce : state.incident.ce;
+
+  results.slice(0, 6).forEach((r) => {
+    const isTarget = r.chunk.isTarget;
+    const isRank1 = r.rank === 1;
+    const borderClass = isTarget && isRank1 ? 'target-rank1' : isTarget ? 'target' : '';
+
+    const scoreBreakdown = buildScoreBreakdown(r);
+
+    const div = document.createElement('div');
+    div.className = `result-row ${borderClass} p-4`;
+    div.innerHTML = `
+      <div class="flex items-start gap-3">
+        <div class="rank-badge rank-${Math.min(r.rank, 99)} ${r.rank > 3 ? 'rank-other' : ''}">${r.rank}</div>
+        <div class="flex-1 min-w-0">
+          <div class="flex items-center gap-2 mb-1">
+            <span class="font-mono text-sm ${isTarget ? 'text-accent font-semibold' : 'text-ink'}">${r.chunk.name}</span>
+            ${isTarget ? '<span class="text-xs bg-accent/10 text-accent border border-accent/30 px-1.5 py-0.5 rounded">target</span>' : ''}
+          </div>
+          ${scoreBreakdown}
+          <div class="mt-2 score-bar-bg">
+            <div class="score-bar-fill" style="width:${barWidth(r.finalScore, isCE)}%; background:${scoreColor(r.finalScore, isCE)}"></div>
+          </div>
+          <div class="flex items-center justify-between mt-1">
+            <span class="text-xs text-muted">${label}</span>
+            <span class="font-mono text-xs font-semibold" style="color:${scoreColor(r.finalScore, isCE)}">${fmtScore(r.finalScore, isCE)}</span>
+          </div>
+        </div>
+        <button class="text-muted hover:text-accent text-xs shrink-0 mt-1 font-mono" data-chunk="${r.chunk.id}">view →</button>
+      </div>
+    `;
+    div.querySelector('[data-chunk]').addEventListener('click', (e) => {
+      e.stopPropagation();
+      showPreview(r.chunk);
+    });
+    el.appendChild(div);
+  });
+}
+
+function buildScoreBreakdown(r) {
+  if (series === 'code') {
+    const s = state.code;
+    if (s.ce) {
+      return `<div class="flex gap-3 text-xs text-muted mt-1">
+        <span>vec <span class="font-mono text-ink">${r.vecScore.toFixed(3)}</span></span>
+        ${s.hybrid ? `<span>lex <span class="font-mono text-ink">${(r.lexScore).toFixed(2)}</span></span>
+        <span>hybrid <span class="font-mono text-ink">${r.hybridScore.toFixed(3)}</span></span>` : ''}
+        <span class="text-accent font-semibold">CE ${fmtScore(r.ceScore, true)}</span>
+      </div>`;
+    }
+    if (s.hybrid) {
+      return `<div class="flex gap-3 text-xs text-muted mt-1">
+        <span>vec <span class="font-mono text-ink">${r.vecScore.toFixed(3)}</span></span>
+        <span>lex <span class="font-mono text-ink">${r.lexScore.toFixed(2)}</span></span>
+        <span class="text-ink">= 0.7×${r.vecScore.toFixed(3)} + 0.3×${r.lexScore.toFixed(2)}</span>
+      </div>`;
+    }
+    return '';
+  } else {
+    const s = state.incident;
+    if (s.ce) {
+      return `<div class="flex gap-3 text-xs text-muted mt-1">
+        <span>vec <span class="font-mono text-ink">${r.vecScore.toFixed(4)}</span></span>
+        <span class="text-accent font-semibold">CE ${fmtScore(r.ceScore, true)}</span>
+      </div>`;
+    }
+    return '';
+  }
+}
+
+function renderPipelineBar() {
+  const bar = document.getElementById('pipeline-bar');
+  bar.innerHTML = '';
+
+  const steps = series === 'code'
+    ? [
+        { label: '50-line chunks', active: !state.code.fn },
+        { label: 'Function boundaries', active: state.code.fn },
+        { label: 'LLM descriptions', active: state.code.desc },
+        { label: 'Hybrid search', active: state.code.hybrid },
+        { label: 'Cross-encoder', active: state.code.ce },
+      ]
+    : [
+        { label: 'Vector search', active: true },
+        { label: 'Hybrid search', active: state.incident.hybrid },
+        { label: 'Cross-encoder', active: state.incident.ce },
+      ];
+
+  steps.forEach((step, i) => {
+    if (i > 0) {
+      const arrow = document.createElement('span');
+      arrow.className = 'pipe-arrow';
+      arrow.textContent = '→';
+      bar.appendChild(arrow);
+    }
+    const el = document.createElement('div');
+    el.className = `pipe-step ${step.active ? 'active' : 'inactive'}`;
+    el.textContent = step.label;
+    bar.appendChild(el);
+  });
+}
+
+function renderFormula() {
+  const box = document.getElementById('formula-box');
+  if (series === 'code') {
+    const s = state.code;
+    const lines = [];
+    const vecBase = s.fn ? (s.desc ? 'vec(fn+desc)' : 'vec(fn)') : (s.desc ? 'vec(line+desc)' : 'vec(line)');
+    if (s.hybrid && s.ce) {
+      lines.push(`hybrid = 0.7 × ${vecBase}`, `      + 0.3 × lex`, ``, `final = CE(query, doc)`);
+    } else if (s.hybrid) {
+      lines.push(`final = 0.7 × ${vecBase}`, `      + 0.3 × lex`);
+    } else if (s.ce) {
+      lines.push(`final = CE(query, doc)`);
+    } else {
+      lines.push(`final = ${vecBase}`);
+    }
+    box.textContent = lines.join('\n');
+  } else {
+    const s = state.incident;
+    if (s.ce) {
+      box.textContent = 'stage 1: vector → top 20\nstage 2: CE(query, doc)\n        → re-sort → top 3';
+    } else if (s.hybrid) {
+      box.textContent = 'final = 0.7 × vec\n      + 0.3 × lex';
+    } else {
+      box.textContent = 'final = cosine(q, doc)';
+    }
+  }
+}
+
+function renderQueryButtons() {
+  const container = document.getElementById('query-buttons');
+  container.innerHTML = '';
+  const queries = series === 'code' ? CODE_QUERIES : INCIDENT_QUERIES;
+  const activeQ = series === 'code' ? state.code.query : state.incident.query;
+  queries.forEach(q => {
+    const btn = document.createElement('button');
+    const isActive = q.id === activeQ;
+    btn.className = `w-full text-left px-3 py-2.5 rounded-lg border text-xs transition-colors ${
+      isActive ? 'border-accent/40 bg-accent/10 text-accent' : 'border-border text-muted hover:border-accent/30 hover:text-ink'
+    }`;
+    btn.innerHTML = `<div class="font-medium mb-0.5">${q.label}</div><div class="font-mono opacity-80 break-all">"${q.text}"</div>`;
+    btn.addEventListener('click', () => {
+      if (series === 'code') state.code.query = q.id;
+      else state.incident.query = q.id;
+      update();
+    });
+    container.appendChild(btn);
+  });
+}
+
+function renderToggles() {
+  const panel = document.getElementById('toggle-panel');
+  panel.innerHTML = '';
+  const toggles = series === 'code' ? CODE_TOGGLES : INCIDENT_TOGGLES;
+
+  toggles.forEach(t => {
+    const isOn = series === 'code' ? state.code[t.id] : state.incident[t.id];
+    const row = document.createElement('div');
+    row.className = 'toggle-row';
+    row.innerHTML = `
+      <div class="flex items-center justify-between gap-2 mb-0.5">
+        <span class="toggle-label text-sm font-medium ${isOn ? 'text-ink' : 'text-muted'}">${t.label}</span>
+        <div class="toggle-switch ${isOn ? 'on' : ''}"></div>
+      </div>
+      <p class="text-xs text-muted leading-relaxed">${t.description}</p>
+    `;
+    row.addEventListener('click', () => {
+      if (series === 'code') state.code[t.id] = !state.code[t.id];
+      else state.incident[t.id] = !state.incident[t.id];
+      update();
+    });
+    panel.appendChild(row);
+  });
+}
+
+function showPreview(chunk) {
+  const panel = document.getElementById('preview-panel');
+  const content = document.getElementById('preview-content');
+  const title = document.getElementById('preview-title');
+  panel.classList.remove('hidden');
+  panel.classList.add('flex');
+  title.textContent = chunk.name;
+
+  const s = state.code;
+  const useFn = s.fn;
+  const useDesc = s.desc;
+
+  let html = '';
+  if (series === 'code') {
+    const codeText = useFn ? chunk.fnCode : chunk.linePreview;
+    html += `<div class="mb-3"><p class="text-muted text-xs mb-1.5">${useFn ? '✓ Function-boundary chunk' : '✗ Line-based chunk (50-line window)'}</p><pre class="text-accent leading-relaxed overflow-x-auto whitespace-pre-wrap">${escHtml(codeText)}</pre></div>`;
+    if (useDesc && chunk.description) {
+      html += `<div class="border-t border-border pt-3 mt-3"><p class="text-muted text-xs mb-1.5">✓ LLM-generated description</p><p class="text-ink leading-relaxed">${escHtml(chunk.description)}</p></div>`;
+    } else if (!useDesc) {
+      html += `<div class="border-t border-border pt-3 mt-3"><p class="text-muted text-xs">✗ No description (toggle LLM descriptions to add)</p></div>`;
+    }
+  } else {
+    html += `<pre class="text-accent leading-relaxed whitespace-pre-wrap">${escHtml(chunk.preview)}</pre>`;
+  }
+
+  content.innerHTML = html;
+}
+
+function escHtml(str) {
+  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function update() {
+  const results = series === 'code' ? computeCodeScores() : computeIncidentScores();
+  renderQueryButtons();
+  renderToggles();
+  renderPipelineBar();
+  renderFormula();
+  renderResults(results);
+  // Close preview on state change
+  document.getElementById('preview-panel').classList.add('hidden');
+  document.getElementById('preview-panel').classList.remove('flex');
+}
+
+// ─── INIT ─────────────────────────────────────────────────────────────────────
+
+document.getElementById('tab-code').addEventListener('click', () => {
+  series = 'code';
+  document.getElementById('tab-code').classList.add('active');
+  document.getElementById('tab-incident').classList.remove('active');
+  update();
+});
+
+document.getElementById('tab-incident').addEventListener('click', () => {
+  series = 'incident';
+  document.getElementById('tab-incident').classList.add('active');
+  document.getElementById('tab-code').classList.remove('active');
+  update();
+});
+
+document.getElementById('close-preview').addEventListener('click', () => {
+  document.getElementById('preview-panel').classList.add('hidden');
+  document.getElementById('preview-panel').classList.remove('flex');
+});
+
+update();
+</script>
+</BaseLayout>
