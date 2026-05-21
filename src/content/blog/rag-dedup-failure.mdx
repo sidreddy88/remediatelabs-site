@@ -24,9 +24,9 @@ All three layers failed simultaneously. Here's why.
 When a production error arrives, before any expensive work happens, the pipeline runs three dedup checks:
 
 ```
-Layer 1  →  String match against open incidents     — hard block
-Layer 2  →  Postgres lookup for resolved incidents       — soft: regression context
-Layer 3  →  RAG semantic search                     — soft: context for TriageAgent
+Layer 1  →  Postgres query for non-terminal incidents   — hard block
+Layer 2  →  Postgres query for resolved incidents       — soft: regression context
+Layer 3  →  RAG semantic search (pgvector)              — soft: context for TriageAgent
 ```
 
 Only Layer 1 was a hard block — it actually dropped the event before an incident was created. Layers 2 and 3 injected context into the triage prompt and let the LLM decide.
@@ -35,9 +35,9 @@ This architecture had three independent failure points, all of which had to be t
 
 ---
 
-## Failure Point 1: Whitespace Broke the String Match
+## Failure Point 1: Whitespace Broke the Description Match
 
-Layer 1 compares the incoming error description to stored incident descriptions using a normalization function:
+Layer 1 queries Postgres for all non-terminal incidents, then compares the incoming error description against each one using a normalization function:
 
 ```python
 return re.sub(r'\b[a-f0-9]{8,}\b|\b\d+[a-zA-Z]*\b', 'X', description[:100]).strip()
@@ -175,7 +175,7 @@ This is what makes compound failures hard to debug. You can read the code for an
 
 <Mermaid
   chart={`flowchart TB
-    Event([Incoming error event]) --> L1{Layer 1<br/>string match<br/>whitespace-collapsed}
+    Event([Incoming error event]) --> L1{Layer 1<br/>Postgres query<br/>+ normalized match}
     L1 -- match --> Drop1([drop · zero API cost])
     L1 -- miss --> L2[Layer 2<br/>Postgres resolved lookup]
     L2 -- regression found --> Ctx1[Soft: regression context<br/>for TriageAgent]
