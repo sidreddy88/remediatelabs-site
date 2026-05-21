@@ -115,11 +115,13 @@ The agents were reasoning correctly. The state handoff between them was broken.
 
 ---
 
-## Failure Point 5: RAG Returned Fragments, Not Files
+## Failure Point 5: RAG Is for Similarity, Not Structure
 
-With the right file identified and the state handoff fixed, `DiagnosisAgent` was pointing at `runPrankChecker` in `prankCheckerMain.js`. This was correct.
+RAG finds semantically similar content — it's excellent for locating files about related topics, similar error patterns, similar domains. It is not designed to return every return statement in a function. Return statements in the same function aren't semantically similar to each other. They're structurally related. RAG doesn't know about structure.
 
-The fix agent audited the function and concluded it was fine.
+For code *discovery*, RAG is the right tool. For code *auditing* — reading every path through a function — you need the full file.
+
+With the right file identified and the state handoff fixed, `DiagnosisAgent` was pointing at `runPrankChecker` in `prankCheckerMain.js`. The fix agent audited the function and concluded it was fine.
 
 It was reading a partial view.
 
@@ -134,8 +136,6 @@ The function has three return paths:
 RAG returned the chunk containing the function signature and the happy path. The error return paths at lines 40–55 were in a different chunk. The agent saw `classification` present in the happy path and concluded the function was correct.
 
 **The agent wasn't wrong. It was reasoning correctly from incomplete data.**
-
-This is a fundamental RAG limitation for code analysis. RAG finds semantic similarity — it's excellent for finding files about similar topics, similar error patterns, similar domains. It is not designed to return every return statement in a function. Those return statements aren't semantically similar to each other. They're structurally related. RAG doesn't know about structure.
 
 **Fix:** Added `get_file_contents(file_path)` tool to `DiagnosisAgent` — fetches the complete raw source from GitHub, capped at 8000 characters. Updated the diagnosis prompt:
 
