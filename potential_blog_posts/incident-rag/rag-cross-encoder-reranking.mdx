@@ -1,0 +1,239 @@
+---
+title: "Cross-Encoder Re-Ranking and Why Two-Stage Retrieval Is the Right Architecture"
+tagline: "Vector scores compress into a narrow band where thresholds are guesswork. Cross-encoders see query and document together and produce a 30× wider signal. Here's why you need both."
+date: 2026-05-14
+tags: ["rag", "architecture", "debugging"]
+readTime: 8
+series: "Incident RAG in Production"
+seriesPart: 6
+seeAlso: ["rag-dedup-failure", "rag-index-vs-live-store"]
+---
+
+*Part 6 of a series on building and debugging RAG systems on a real production codebase. Earlier posts fixed boilerplate, dedup, and added hybrid lexical search. This post is about a deeper architectural decision: why vector retrieval alone isn't enough for precision, and how cross-encoder re-ranking fixes it.*
+
+---
+
+Vector search asks *"are these two things in the same neighborhood?"* Cross-encoder re-ranking asks *"given this specific question, is this specific document the answer?"* — and it can tell the difference between "handles S3 errors including NoSuchKey" and "uploads to S3 and handles upload errors" in a way vector similarity cannot.
+
+Here's why that distinction matters, and what it costs.
+
+---
+
+## The problem vector search can't solve alone
+
+After five posts of fixes, my RAG pipeline was working well on the four production-length queries I introduced at the end of Part 5 — all returned the correct incident at rank 1. The eval harness was passing 8/8. Retrieval scores were reasonable.
+
+But there was a persistent issue I couldn't fix by tuning the indexed text: vector scores are compressed.
+
+Here's what top-10 results look like for a typical query:
+
+```
+rank 1:  0.79  S3_NO_SUCH_KEY: S3 throws NoSuchKey...
+rank 2:  0.66  SYNTAXERROR: Failed to parse model JSON...
+rank 3:  0.58  TYPEERROR: TypeError: Cannot read properties...
+rank 4:  0.51  S3_NO_SUCH_KEY: S3 throws NoSuchKey...
+rank 5:  0.51  S3_NO_SUCH_KEY: S3 throws NoSuchKey...
+rank 6:  0.13  S3_NO_SUCH_KEY: test | Root cause: NoSuchKey
+```
+
+The scores span 0.13 to 0.79. The gap between rank 1 (clearly relevant) and rank 3 (weakly relevant) is only 0.21. Setting a threshold of `min_score=0.80` would exclude the correct answer. Setting it to `0.50` would let in noise.
+
+This compression happens because cosine similarity measures the angle between two vectors in 1536-dimensional space. Most angles between natural language texts cluster in a relatively narrow band — everything is "somewhat related" because all text shares common vocabulary and structure. The signal is real but the dynamic range is narrow.
+
+---
+
+## What cross-encoder re-ranking does differently
+
+Vector retrieval uses bi-encoders: the query is embedded independently, the document is embedded independently, and similarity is measured between those two separate vectors.
+
+```
+query  → [embed] → vector_q
+doc    → [embed] → vector_d
+similarity = cosine(vector_q, vector_d)
+```
+
+The key word is "independently." The query embedding has no knowledge of any specific document. The document embedding has no knowledge of any specific query. Similarity is approximate — it asks "are these in the same region of space?" not "does this document answer this query?"
+
+Cross-encoders work differently. They take the query and document together, as a single concatenated input, and output a relevance score:
+
+```
+[query] [SEP] [document] → transformer → relevance score
+```
+
+The model sees both at the same time. It can attend to interactions between them — specific words in the query matching specific phrases in the document, the query's intent matching the document's structure. The score it produces is a direct relevance judgment, not a geometric approximation.
+
+This is fundamentally more accurate than bi-encoder similarity. The trade-off is speed: you can't pre-compute cross-encoder scores for every document, because the score depends on the query. Every query requires running inference over every candidate document. That's why cross-encoders are used for re-ranking, not full corpus search.
+
+---
+
+## The two-stage architecture
+
+The right pattern is:
+
+**Stage 1 — Vector retrieval (recall)**
+
+Embed the query. Find the top K candidates from the full corpus using cosine similarity. This is fast (single embedding call + ANN lookup) and scales to millions of documents. The goal is recall: don't miss the right answer. Fetch more than you need — 20 candidates instead of 3.
+
+**Stage 2 — Cross-encoder re-ranking (precision)**
+
+Take the K candidates from stage 1. Run `(query, doc)` pairs through the cross-encoder. Re-sort by cross-encoder score. Return the top 3.
+
+```
+full corpus (70 incidents)
+    → vector search → top 20 candidates
+    → cross-encoder → top 3 (re-ranked)
+```
+
+Stage 1 is O(1) at query time (pre-computed doc vectors). Stage 2 is O(K) inference calls, but K is small (20). The total cost is: one embedding call + one ANN lookup + 20 cross-encoder inferences. That's fast enough for my use case.
+
+---
+
+## Installing the cross-encoder
+
+```bash
+pip install sentence-transformers
+```
+
+The model I used is `cross-encoder/ms-marco-MiniLM-L-6-v2` — a 6-layer MiniLM trained on the MS MARCO passage ranking dataset. About 90MB. First call downloads it and caches it locally.
+
+Why this model? It's the standard starting point for production re-ranking. Trained on web search queries over passages, which is semantically close to "error descriptions queried against incident documents." Smaller than the full ms-marco models, fast enough for synchronous inference over 20 candidates.
+
+---
+
+## The implementation
+
+```python
+async def rerank_incidents(
+    self,
+    query: str,
+    n_results: int = 3,
+    candidate_pool: int = 20,
+) -> list[dict]:
+    # Stage 1: vector retrieval — fetch wide candidate set
+    candidates = await self.search_incidents(query, n_results=candidate_pool, min_score=0.0)
+    if not candidates:
+        return []
+
+    # Stage 2: cross-encoder re-ranking
+    if not hasattr(self, "_cross_encoder"):
+        self._cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    ce = self._cross_encoder
+
+    pairs = [(query, r["text"]) for r in candidates]
+    ce_scores = ce.predict(pairs)
+
+    for r, ce_score in zip(candidates, ce_scores):
+        r["ce_score"] = round(float(ce_score), 4)
+        r["vector_score"] = r.pop("score")
+
+    reranked = sorted(candidates, key=lambda x: x["ce_score"], reverse=True)
+    return reranked[:n_results]
+```
+
+Three design decisions worth explaining:
+
+**`min_score=0.0` in stage 1.** The whole point of two-stage retrieval is that stage 2 will re-rank. If you apply a score threshold in stage 1, you risk excluding the document that the cross-encoder would have ranked first. Fetch everything reasonable and let CE decide.
+
+**Cache the model on the instance.** `CrossEncoder(...)` loads 90MB of weights. Loading it fresh on every query call would add hundreds of milliseconds. The `hasattr(self, "_cross_encoder")` check initialises it once and reuses it. In production you'd move this to `__init__` with a conditional import.
+
+**Rename `score` to `vector_score`.** The result dict now has both `vector_score` (the original cosine similarity) and `ce_score` (the cross-encoder output). Keeping both is important for observability — you can see which component drove each result.
+
+---
+
+## What the scores look like
+
+Running four queries through both systems:
+
+```
+Query                                   Vec rank  Vec score  CE rank   CE score
+---------------------------------------------------------------------------------
+classifyFields json parse error openai         1     0.5613        1     +7.3668
+publish_decision undefined classification      1     0.5120        1     +7.3773
+S3 NoSuchKey missing key copy delete           1     0.7916        1     +7.8514
+file not found when copying object in S3       1     0.5228        1     -0.3482
+```
+
+The rankings didn't change — our corpus is already well-tuned after the earlier fixes. But look at the CE scores.
+
+CE scores for unrelated documents:
+
+```
+TYPEERROR (irrelevant to S3 query):     -9.06
+S3 test doc (minimal content):         -11.23
+S3_NO_SUCH_KEY (another incident):     -11.34
+```
+
+Vector scores for the same unrelated documents:
+
+```
+TYPEERROR (irrelevant to S3 query):     0.21
+S3 test doc:                           0.25
+S3_NO_SUCH_KEY (another incident):     0.17
+```
+
+CE: +7.8 vs −11.3 = a gap of 19 points. Vector: 0.79 vs 0.17 = a gap of 0.62.
+
+**The cross-encoder's score spread is 30× wider than vector's.** That's the difference between a signal you can threshold confidently and one you have to guess at.
+
+---
+
+## The "file not found" case
+
+One result is worth examining closely:
+
+```
+Query: "file not found when copying object in S3"
+Vector score: 0.52  (confident positive)
+CE score:    -0.35  (uncertain — barely below 0)
+```
+
+Vector search found the semantic connection — "file not found" ≈ "NoSuchKey" in S3 context. The embedding model has seen enough training data to know these concepts are related.
+
+The cross-encoder is less sure. It reads both strings together and notices the mismatch: the query says "file" but the document consistently says "key." In S3, these are the same thing — an S3 key is what you'd call a file path elsewhere. But the model was trained on web search data, where "file not found" and "S3 key not found" don't co-occur often enough for it to learn the equivalence.
+
+This is a real limitation of cross-encoders: they're only as good as their training distribution. `ms-marco-MiniLM` was trained on web queries. Software incidents are a different distribution. A model fine-tuned on software error data would handle this better.
+
+The vector search got it right in this case because semantic embeddings capture broader conceptual similarity without requiring exact vocabulary overlap. The cross-encoder was more literal.
+
+This is the argument for two-stage retrieval: **use each model where it's strongest**. Vector for broad semantic recall, cross-encoder for filtering and scoring the shortlist. If the cross-encoder were used alone, the "file not found" query would miss the correct incident entirely.
+
+---
+
+## When cross-encoder helps most
+
+On my current corpus of 7 incidents, the cross-encoder doesn't change rankings — the vector search already gets the right answer first after our earlier fixes. So why use it?
+
+**Score calibration.** The CE score is a better proxy for "how confident should I be?" than vector cosine similarity. In production, I can set a threshold of `ce_score > 0` instead of guessing at a cosine value like `min_score = 0.80`.
+
+**At corpus scale, it fixes rank inversions.** With 7 incidents, there's not much that can go wrong in the top 3. With 700 incidents across dozens of distinct bugs, similar-but-wrong incidents will creep into the top 3. The cross-encoder, seeing query and doc together, will catch those cases.
+
+**Future-proofing the pipeline.** The two-stage architecture is in place now. When the corpus grows, re-ranking kicks in without any code changes.
+
+---
+
+## The architecture in full
+
+After all six exercises, the retrieval pipeline looks like this:
+
+```
+new error event arrives
+│
+├── Dedup gate (search_incidents, min_score=0.90)
+│   └── Embeds query → vector search → if score ≥ 0.90, block as duplicate
+│
+└── Context retrieval (rerank_incidents, candidate_pool=20)
+    ├── Stage 1: embed query → vector search → top 20 candidates
+    └── Stage 2: cross-encoder scores (query, doc) pairs → re-sort → top 3
+        └── top 3 passed to TriageAgent as prior context
+```
+
+Two separate paths with different tools:
+
+- **Dedup:** pure vector (fast, semantic, no CE overhead)
+- **Context retrieval:** two-stage (vector for recall, CE for precision)
+
+The dedup gate doesn't need CE precision — it just needs to know "is this the same bug?" and cosine ≥ 0.90 is a reliable signal for that. The context retrieval path needs the 3 most relevant past incidents, which benefits from CE's finer-grained relevance judgment.
+
+---
+
+*This post completes the six-exercise RAG series. Starting from a system that indexed boilerplate-dominated text and failed dedup on same-bug incidents, we built: clean indexed text, metadata separation, a recall@3 eval harness, hybrid lexical+semantic search, and two-stage cross-encoder re-ranking. Every change was measured. Every bug was found with data, not intuition.*
