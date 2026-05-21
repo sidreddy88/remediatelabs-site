@@ -4,20 +4,13 @@ import BaseLayout from "../layouts/BaseLayout.astro";
 
 <BaseLayout
   title="RAG Playground — Remediate Labs"
-  description="Interactive explorer for Code RAG and Incident RAG pipeline stages. Toggle function-boundary chunks, LLM descriptions, hybrid search, and cross-encoder re-ranking."
+  description="Interactive explorer for the Code RAG pipeline. Toggle function-boundary chunks, LLM descriptions, hybrid search, and cross-encoder re-ranking."
 >
   <div class="min-h-screen bg-bg">
     <!-- header -->
-    <div class="border-b border-border px-6 py-4 flex items-center justify-between">
-      <div>
-        <h1 class="text-lg font-semibold text-ink">RAG Pipeline Playground</h1>
-        <p class="text-sm text-muted mt-0.5">Toggle techniques and see how rankings change in real time</p>
-      </div>
-      <!-- series tabs -->
-      <div class="flex gap-1 bg-surface rounded-lg p-1 border border-border">
-        <button id="tab-code" class="tab-btn active px-4 py-1.5 rounded-md text-sm font-medium transition-colors">Code RAG</button>
-        <button id="tab-incident" class="tab-btn px-4 py-1.5 rounded-md text-sm font-medium transition-colors">Incident RAG</button>
-      </div>
+    <div class="border-b border-border px-6 py-4">
+      <h1 class="text-lg font-semibold text-ink">RAG Pipeline Playground</h1>
+      <p class="text-sm text-muted mt-0.5">Toggle techniques and see how rankings change in real time</p>
     </div>
 
     <div class="flex" style="height: calc(100vh - 65px)">
@@ -65,8 +58,6 @@ import BaseLayout from "../layouts/BaseLayout.astro";
 </BaseLayout>
 
 <style>
-  .tab-btn { color: #9aa1a9; }
-  .tab-btn.active { background: #23272d; color: #e6e8eb; }
   .toggle-row { cursor: pointer; }
   .toggle-row:hover .toggle-label { color: #e6e8eb; }
   .toggle-switch {
@@ -402,7 +393,6 @@ async function deleteFileFromS3(key, bucketName) {
 // hybridScore = 0.7 * vecEnriched + 0.3 * lexWithdesc
 // Documented values from blog posts are marked ✓
 
-// Scores: [vecLine, vecFn, vecEnriched, lexNodesc, lexWithdesc, ceScore]
 // move_441 / move_481 are line-only chunks — only vecLine is used (fnOnly `move` handles fn-boundary stages)
 // vecLine values set so line-based rankings match blog: Q1→r1, Q2→r3/r4, Q3→r4, Q4→not found
 const CODE_SCORES = {
@@ -434,7 +424,7 @@ const CODE_SCORES = {
     dimensions:[0.340, 0.380, 0.375, 0.20, 0.20, -2.50],
     fix:       [0.315, 0.353, 0.347, 0.20, 0.20, -3.10],
     thumbnail: [0.510, 0.362, 0.355, 0.20, 0.20, -2.60], // r3 in line-mode
-    delete:    [0.535, 0.640, 0.640, 0.40, 0.40, +1.80], // r1 line ✓; fn-boundary r1 ✓ (deleteImageVariantsFromS3); enriched r1 ✓
+    delete:    [0.535, 0.640, 0.640, 0.40, 0.40, +1.80], // r1 line ✓; fn-boundary r1 ✓; enriched r1 ✓
   },
   q4: { // "S3 NoSuchKey missing key error" — not found in all pre-hybrid stages ✓
     move_441:  [0.195, 0, 0, 0, 0, 0], // r6 — not in top 5 ✓
@@ -449,10 +439,10 @@ const CODE_SCORES = {
 };
 
 const CODE_QUERIES = [
-  { id: 'q1', text: 'moveAndRemoveFileFromS3', label: 'Function name', color: 'accent' },
-  { id: 'q2', text: 'copy S3 object then delete source', label: 'Natural language', color: 'accent' },
-  { id: 'q3', text: 'S3 copyObject deleteObject bucket key', label: 'API call names', color: 'accent' },
-  { id: 'q4', text: 'S3 NoSuchKey missing key error', label: 'Incident vocabulary', color: 'accent' },
+  { id: 'q1', text: 'moveAndRemoveFileFromS3', label: 'Function name' },
+  { id: 'q2', text: 'copy S3 object then delete source', label: 'Natural language' },
+  { id: 'q3', text: 'S3 copyObject deleteObject bucket key', label: 'API call names' },
+  { id: 'q4', text: 'S3 NoSuchKey missing key error', label: 'Incident vocabulary' },
 ];
 
 const CODE_TOGGLES = [
@@ -462,115 +452,15 @@ const CODE_TOGGLES = [
   { id: 'ce', label: 'Cross-encoder re-ranking', description: 'Re-score top-20 candidates by running (query, doc) pairs through a cross-encoder model.' },
 ];
 
-// ─── INCIDENT RAG DATA ────────────────────────────────────────────────────────
-
-const INCIDENT_CHUNKS = [
-  {
-    id: 'nosuchkey',
-    name: 'S3_NO_SUCH_KEY',
-    isTarget: true,
-    preview: `S3_NO_SUCH_KEY: S3 throws NoSuchKey when attempting
-to copyObject from a source path that no longer exists.
-Root cause: race condition between image deletion job
-and copy pipeline. Bucket: printtool123, region: us-east-2.
-Fix: check object existence before copy, or catch
-NoSuchKey and skip.`,
-  },
-  {
-    id: 'typeerror',
-    name: 'TYPEERROR_CLASSIFY',
-    preview: `TYPEERROR: TypeError: Cannot read properties of
-undefined (reading 'classification'). Thrown in
-classifyFields when OpenAI response is missing the
-expected JSON structure. Root cause: model returned
-plain text instead of JSON. Fix: add JSON parse guard.`,
-  },
-  {
-    id: 'syntaxerror',
-    name: 'SYNTAXERROR_JSON',
-    preview: `SYNTAXERROR: Failed to parse model JSON in
-publish_decision handler. Model output included markdown
-fences around the JSON block. Root cause: prompt did not
-specify raw JSON output. Fix: strip markdown before parse.`,
-  },
-  {
-    id: 'filenotfound',
-    name: 'FILE_NOT_FOUND',
-    preview: `FILE_NOT_FOUND: ENOENT when copying file during
-S3 upload pre-processing step. Temp file deleted before
-upload completed. Root cause: overlapping cleanup cron
-and upload handler. Fix: use exclusive temp paths.`,
-  },
-  {
-    id: 'timeout',
-    name: 'LAMBDA_TIMEOUT',
-    preview: `LAMBDA_TIMEOUT: Function timed out at 30s during
-batch image resize. S3 getObject calls blocking on large
-images. Root cause: no parallel processing. Fix: use
-Promise.all with concurrency limit.`,
-  },
-];
-
-// Scores: [vecScore, lexScore, ceScore]
-// lexScore = fraction of query tokens found in doc (case-insensitive substring)
-// hybridScore = 0.7 * vecScore + 0.3 * lexScore
-const INCIDENT_SCORES = {
-  q1: { // "classifyFields json parse error openai" — target: syntaxerror (vec=0.5613, CE=+7.37 from blog)
-    nosuchkey:   [0.21, 0.00, +0.18],
-    typeerror:   [0.50, 1.00, +5.40],  // rank 2; all tokens present but error is TypeError not a JSON parse error
-    syntaxerror: [0.56, 1.00, +7.37],  // vec=0.5613 ✓, ce=+7.37 ✓; literally "Failed to parse model JSON at classifyFields, openai missing json_object"
-    filenotfound:[0.18, 0.00, -3.20],
-    timeout:     [0.15, 0.00, -4.10],
-  },
-  q2: { // "publish_decision undefined classification" — target: typeerror (vec=0.5120, CE=+7.38 from blog)
-    nosuchkey:   [0.18, 0.00, -2.80],
-    typeerror:   [0.51, 0.67, +7.38],  // vec=0.5120 ✓, ce=+7.38 ✓; 2/3 tokens (undefined, classification)
-    syntaxerror: [0.47, 0.33, +4.20],  // 1/3 tokens (publish_decision); vec was 0.56 (wrong), ce was +8.20 (wrong)
-    filenotfound:[0.19, 0.00, -3.10],
-    timeout:     [0.16, 0.00, -4.20],
-  },
-  q3: { // "S3 NoSuchKey copy delete missing key" — target: nosuchkey (vec=0.7916, CE=+7.85 from blog)
-    nosuchkey:   [0.79, 0.83, +7.85],  // vec=0.7916 ✓, ce=+7.85 ✓; 5/6 tokens (s3,nosuchkey,copy,delete,key)
-    typeerror:   [0.22, 0.17, -9.06],  // vec≈0.21 ✓; ce was -2.10 → -9.06 from blog; 1/6 tokens (missing)
-    syntaxerror: [0.18, 0.00, -4.30],
-    filenotfound:[0.51, 0.50, +3.20],  // 3/6 tokens (s3, copy, delete)
-    timeout:     [0.25, 0.17, -1.80],  // 1/6 tokens (s3)
-  },
-  q4: { // "file not found when copying object in S3" — nosuchkey rank 1 by vec (0.5228 from blog)
-    nosuchkey:   [0.52, 0.50, -0.35],  // vec=0.5228 ✓, ce=-0.35 ✓; 4/8 tokens (when,object,in,s3)
-    typeerror:   [0.20, 0.25, -3.10],  // 2/8 tokens (when,in)
-    syntaxerror: [0.16, 0.13, -4.80],  // 1/8 tokens (in)
-    filenotfound:[0.48, 0.88, +6.80],  // vec was 0.60 (wrong—ranked above nosuchkey); 7/8 tokens (file,not,found,when,copying,in,s3)
-    timeout:     [0.31, 0.25, +1.20],  // 2/8 tokens (in,s3)
-  },
-};
-
-const INCIDENT_QUERIES = [
-  { id: 'q1', text: 'classifyFields json parse error openai', label: 'Classification failure' },
-  { id: 'q2', text: 'publish_decision undefined classification', label: 'Undefined property' },
-  { id: 'q3', text: 'S3 NoSuchKey copy delete missing key', label: 'S3 key error' },
-  { id: 'q4', text: 'file not found when copying object in S3', label: 'Vocabulary mismatch' },
-];
-
-const INCIDENT_TOGGLES = [
-  { id: 'hybrid', label: 'Hybrid search', description: 'Mix vector + BM25 lexical. Rewards exact token matches like error codes and identifiers.' },
-  { id: 'ce', label: 'Cross-encoder re-ranking', description: 'Re-score top-20 candidates with (query, doc) pairs. 30× wider score spread than vector alone.' },
-];
-
 // ─── STATE ────────────────────────────────────────────────────────────────────
 
-let series = 'code';
-let state = {
-  code: { query: 'q4', fn: false, desc: false, hybrid: false, ce: false },
-  incident: { query: 'q3', hybrid: false, ce: false },
-};
+let state = { query: 'q4', fn: false, desc: false, hybrid: false, ce: false };
 
 // ─── SCORE COMPUTATION ────────────────────────────────────────────────────────
 
-function computeCodeScores() {
-  const s = state.code;
+function computeScores() {
+  const s = state;
   const queryScores = CODE_SCORES[s.query];
-  // Line-based mode shows split chunks (move_441, move_481); fn-boundary mode shows single move chunk
   const chunks = CODE_CHUNKS.filter(c => s.fn ? !c.lineOnly : !c.fnOnly);
   const results = chunks.map(chunk => {
     const [vecLine, vecFn, vecEnriched, lexNodesc, lexWithdesc, ceScore] = queryScores[chunk.id];
@@ -580,33 +470,9 @@ function computeCodeScores() {
     const hybridScore = s.hybrid ? (0.7 * vecScore + 0.3 * lexScore) : vecScore;
     const finalScore = s.ce ? ceScore : hybridScore;
 
-    return {
-      chunk,
-      vecScore,
-      lexScore,
-      hybridScore,
-      ceScore,
-      finalScore,
-      isHybrid: s.hybrid,
-      isCE: s.ce,
-    };
+    return { chunk, vecScore, lexScore, hybridScore, ceScore, finalScore, isHybrid: s.hybrid, isCE: s.ce };
   });
 
-  results.sort((a, b) => b.finalScore - a.finalScore);
-  results.forEach((r, i) => { r.rank = i + 1; });
-  return results;
-}
-
-function computeIncidentScores() {
-  const s = state.incident;
-  const queryScores = INCIDENT_SCORES[s.query];
-  const results = INCIDENT_CHUNKS.map(chunk => {
-    const [vecScore, lexScore, ceScore] = queryScores[chunk.id];
-    const hybridScore = 0.7 * vecScore + 0.3 * lexScore;
-    const baseScore = s.hybrid ? hybridScore : vecScore;
-    const finalScore = s.ce ? ceScore : baseScore;
-    return { chunk, vecScore, lexScore, hybridScore, ceScore, finalScore, isCE: s.ce };
-  });
   results.sort((a, b) => b.finalScore - a.finalScore);
   results.forEach((r, i) => { r.rank = i + 1; });
   return results;
@@ -641,17 +507,13 @@ function renderResults(results) {
   const el = document.getElementById('results-list');
   el.innerHTML = '';
 
-  const label = series === 'code'
-    ? (state.code.ce ? 'CE score' : state.code.hybrid ? 'Hybrid score' : 'Vector score')
-    : (state.incident.ce ? 'CE score' : state.incident.hybrid ? 'Hybrid score' : 'Vector score');
-
-  const isCE = series === 'code' ? state.code.ce : state.incident.ce;
+  const label = state.ce ? 'CE score' : state.hybrid ? 'Hybrid score' : 'Vector score';
+  const isCE = state.ce;
 
   results.slice(0, 6).forEach((r) => {
     const isTarget = r.chunk.isTarget;
     const isRank1 = r.rank === 1;
     const borderClass = isTarget && isRank1 ? 'target-rank1' : isTarget ? 'target' : '';
-
     const scoreBreakdown = buildScoreBreakdown(r);
 
     const div = document.createElement('div');
@@ -685,60 +547,35 @@ function renderResults(results) {
 }
 
 function buildScoreBreakdown(r) {
-  if (series === 'code') {
-    const s = state.code;
-    if (s.ce) {
-      return `<div class="flex gap-3 text-xs text-muted mt-1">
-        <span>vec <span class="font-mono text-ink">${r.vecScore.toFixed(3)}</span></span>
-        ${s.hybrid ? `<span>lex <span class="font-mono text-ink">${(r.lexScore).toFixed(2)}</span></span>
-        <span>hybrid <span class="font-mono text-ink">${r.hybridScore.toFixed(3)}</span></span>` : ''}
-        <span class="text-accent font-semibold">CE ${fmtScore(r.ceScore, true)}</span>
-      </div>`;
-    }
-    if (s.hybrid) {
-      return `<div class="flex gap-3 text-xs text-muted mt-1">
-        <span>vec <span class="font-mono text-ink">${r.vecScore.toFixed(3)}</span></span>
-        <span>lex <span class="font-mono text-ink">${r.lexScore.toFixed(2)}</span></span>
-        <span class="text-ink">= 0.7×${r.vecScore.toFixed(3)} + 0.3×${r.lexScore.toFixed(2)}</span>
-      </div>`;
-    }
-    return '';
-  } else {
-    const s = state.incident;
-    if (s.ce) {
-      return `<div class="flex gap-3 text-xs text-muted mt-1">
-        <span>vec <span class="font-mono text-ink">${r.vecScore.toFixed(4)}</span></span>
-        <span class="text-accent font-semibold">CE ${fmtScore(r.ceScore, true)}</span>
-      </div>`;
-    }
-    if (s.hybrid) {
-      return `<div class="flex gap-3 text-xs text-muted mt-1">
-        <span>vec <span class="font-mono text-ink">${r.vecScore.toFixed(4)}</span></span>
-        <span>lex <span class="font-mono text-ink">${r.lexScore.toFixed(2)}</span></span>
-        <span class="text-ink">= 0.7×${r.vecScore.toFixed(4)} + 0.3×${r.lexScore.toFixed(2)}</span>
-      </div>`;
-    }
-    return '';
+  if (state.ce) {
+    return `<div class="flex gap-3 text-xs text-muted mt-1">
+      <span>vec <span class="font-mono text-ink">${r.vecScore.toFixed(3)}</span></span>
+      ${state.hybrid ? `<span>lex <span class="font-mono text-ink">${r.lexScore.toFixed(2)}</span></span>
+      <span>hybrid <span class="font-mono text-ink">${r.hybridScore.toFixed(3)}</span></span>` : ''}
+      <span class="text-accent font-semibold">CE ${fmtScore(r.ceScore, true)}</span>
+    </div>`;
   }
+  if (state.hybrid) {
+    return `<div class="flex gap-3 text-xs text-muted mt-1">
+      <span>vec <span class="font-mono text-ink">${r.vecScore.toFixed(3)}</span></span>
+      <span>lex <span class="font-mono text-ink">${r.lexScore.toFixed(2)}</span></span>
+      <span class="text-ink">= 0.7×${r.vecScore.toFixed(3)} + 0.3×${r.lexScore.toFixed(2)}</span>
+    </div>`;
+  }
+  return '';
 }
 
 function renderPipelineBar() {
   const bar = document.getElementById('pipeline-bar');
   bar.innerHTML = '';
 
-  const steps = series === 'code'
-    ? [
-        { label: '50-line chunks', active: !state.code.fn },
-        { label: 'Function boundaries', active: state.code.fn },
-        { label: 'LLM descriptions', active: state.code.desc },
-        { label: 'Hybrid search', active: state.code.hybrid },
-        { label: 'Cross-encoder', active: state.code.ce },
-      ]
-    : [
-        { label: 'Vector search', active: true },
-        { label: 'Hybrid search', active: state.incident.hybrid },
-        { label: 'Cross-encoder', active: state.incident.ce },
-      ];
+  const steps = [
+    { label: '50-line chunks', active: !state.fn },
+    { label: 'Function boundaries', active: state.fn },
+    { label: 'LLM descriptions', active: state.desc },
+    { label: 'Hybrid search', active: state.hybrid },
+    { label: 'Cross-encoder', active: state.ce },
+  ];
 
   steps.forEach((step, i) => {
     if (i > 0) {
@@ -756,47 +593,33 @@ function renderPipelineBar() {
 
 function renderFormula() {
   const box = document.getElementById('formula-box');
-  if (series === 'code') {
-    const s = state.code;
-    const lines = [];
-    const vecBase = s.fn ? (s.desc ? 'vec(fn+desc)' : 'vec(fn)') : (s.desc ? 'vec(line+desc)' : 'vec(line)');
-    if (s.hybrid && s.ce) {
-      lines.push(`hybrid = 0.7 × ${vecBase}`, `      + 0.3 × lex`, ``, `final = CE(query, doc)`);
-    } else if (s.hybrid) {
-      lines.push(`final = 0.7 × ${vecBase}`, `      + 0.3 × lex`);
-    } else if (s.ce) {
-      lines.push(`final = CE(query, doc)`);
-    } else {
-      lines.push(`final = ${vecBase}`);
-    }
-    box.textContent = lines.join('\n');
+  const s = state;
+  const lines = [];
+  const vecBase = s.fn ? (s.desc ? 'vec(fn+desc)' : 'vec(fn)') : (s.desc ? 'vec(line+desc)' : 'vec(line)');
+  if (s.hybrid && s.ce) {
+    lines.push(`hybrid = 0.7 × ${vecBase}`, `      + 0.3 × lex`, ``, `final = CE(query, doc)`);
+  } else if (s.hybrid) {
+    lines.push(`final = 0.7 × ${vecBase}`, `      + 0.3 × lex`);
+  } else if (s.ce) {
+    lines.push(`final = CE(query, doc)`);
   } else {
-    const s = state.incident;
-    if (s.ce) {
-      box.textContent = 'stage 1: vector → top 20\nstage 2: CE(query, doc)\n        → re-sort → top 3';
-    } else if (s.hybrid) {
-      box.textContent = 'final = 0.7 × vec\n      + 0.3 × lex';
-    } else {
-      box.textContent = 'final = cosine(q, doc)';
-    }
+    lines.push(`final = ${vecBase}`);
   }
+  box.textContent = lines.join('\n');
 }
 
 function renderQueryButtons() {
   const container = document.getElementById('query-buttons');
   container.innerHTML = '';
-  const queries = series === 'code' ? CODE_QUERIES : INCIDENT_QUERIES;
-  const activeQ = series === 'code' ? state.code.query : state.incident.query;
-  queries.forEach(q => {
+  CODE_QUERIES.forEach(q => {
     const btn = document.createElement('button');
-    const isActive = q.id === activeQ;
+    const isActive = q.id === state.query;
     btn.className = `w-full text-left px-3 py-2.5 rounded-lg border text-xs transition-colors ${
       isActive ? 'border-accent/40 bg-accent/10 text-accent' : 'border-border text-muted hover:border-accent/30 hover:text-ink'
     }`;
     btn.innerHTML = `<div class="font-medium mb-0.5">${q.label}</div><div class="font-mono opacity-80 break-all">"${q.text}"</div>`;
     btn.addEventListener('click', () => {
-      if (series === 'code') state.code.query = q.id;
-      else state.incident.query = q.id;
+      state.query = q.id;
       update();
     });
     container.appendChild(btn);
@@ -806,10 +629,8 @@ function renderQueryButtons() {
 function renderToggles() {
   const panel = document.getElementById('toggle-panel');
   panel.innerHTML = '';
-  const toggles = series === 'code' ? CODE_TOGGLES : INCIDENT_TOGGLES;
-
-  toggles.forEach(t => {
-    const isOn = series === 'code' ? state.code[t.id] : state.incident[t.id];
+  CODE_TOGGLES.forEach(t => {
+    const isOn = state[t.id];
     const row = document.createElement('div');
     row.className = 'toggle-row';
     row.innerHTML = `
@@ -820,8 +641,7 @@ function renderToggles() {
       <p class="text-xs text-muted leading-relaxed">${t.description}</p>
     `;
     row.addEventListener('click', () => {
-      if (series === 'code') state.code[t.id] = !state.code[t.id];
-      else state.incident[t.id] = !state.incident[t.id];
+      state[t.id] = !state[t.id];
       update();
     });
     panel.appendChild(row);
@@ -836,23 +656,15 @@ function showPreview(chunk) {
   panel.classList.add('flex');
   title.textContent = chunk.name;
 
-  const s = state.code;
-  const useFn = s.fn;
-  const useDesc = s.desc;
+  const isLineChunk = chunk.lineOnly;
+  const codeText = (!isLineChunk && state.fn) ? chunk.fnCode : chunk.linePreview;
+  const chunkLabel = isLineChunk ? '✗ Line-based chunk (50-line window)' : (state.fn ? '✓ Function-boundary chunk' : '✗ Line-based chunk (50-line window)');
 
-  let html = '';
-  if (series === 'code') {
-    const isLineChunk = chunk.lineOnly;
-    const codeText = (!isLineChunk && useFn) ? chunk.fnCode : chunk.linePreview;
-    const chunkLabel = isLineChunk ? '✗ Line-based chunk (50-line window)' : (useFn ? '✓ Function-boundary chunk' : '✗ Line-based chunk (50-line window)');
-    html += `<div class="mb-3"><p class="text-muted text-xs mb-1.5">${chunkLabel}</p><pre class="text-accent leading-relaxed overflow-x-auto whitespace-pre-wrap">${escHtml(codeText)}</pre></div>`;
-    if (useDesc && chunk.description) {
-      html += `<div class="border-t border-border pt-3 mt-3"><p class="text-muted text-xs mb-1.5">✓ LLM-generated description</p><p class="text-ink leading-relaxed">${escHtml(chunk.description)}</p></div>`;
-    } else if (!useDesc) {
-      html += `<div class="border-t border-border pt-3 mt-3"><p class="text-muted text-xs">✗ No description (toggle LLM descriptions to add)</p></div>`;
-    }
-  } else {
-    html += `<pre class="text-accent leading-relaxed whitespace-pre-wrap">${escHtml(chunk.preview)}</pre>`;
+  let html = `<div class="mb-3"><p class="text-muted text-xs mb-1.5">${chunkLabel}</p><pre class="text-accent leading-relaxed overflow-x-auto whitespace-pre-wrap">${escHtml(codeText)}</pre></div>`;
+  if (state.desc && chunk.description) {
+    html += `<div class="border-t border-border pt-3 mt-3"><p class="text-muted text-xs mb-1.5">✓ LLM-generated description</p><p class="text-ink leading-relaxed">${escHtml(chunk.description)}</p></div>`;
+  } else if (!state.desc) {
+    html += `<div class="border-t border-border pt-3 mt-3"><p class="text-muted text-xs">✗ No description (toggle LLM descriptions to add)</p></div>`;
   }
 
   content.innerHTML = html;
@@ -863,32 +675,16 @@ function escHtml(str) {
 }
 
 function update() {
-  const results = series === 'code' ? computeCodeScores() : computeIncidentScores();
   renderQueryButtons();
   renderToggles();
   renderPipelineBar();
   renderFormula();
-  renderResults(results);
-  // Close preview on state change
+  renderResults(computeScores());
   document.getElementById('preview-panel').classList.add('hidden');
   document.getElementById('preview-panel').classList.remove('flex');
 }
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────
-
-document.getElementById('tab-code').addEventListener('click', () => {
-  series = 'code';
-  document.getElementById('tab-code').classList.add('active');
-  document.getElementById('tab-incident').classList.remove('active');
-  update();
-});
-
-document.getElementById('tab-incident').addEventListener('click', () => {
-  series = 'incident';
-  document.getElementById('tab-incident').classList.add('active');
-  document.getElementById('tab-code').classList.remove('active');
-  update();
-});
 
 document.getElementById('close-preview').addEventListener('click', () => {
   document.getElementById('preview-panel').classList.add('hidden');
