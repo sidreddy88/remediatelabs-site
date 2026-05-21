@@ -5,11 +5,11 @@ date: 2026-05-12
 tags: ["rag", "architecture", "debugging"]
 readTime: 8
 series: "Code RAG in Production"
-seriesPart: 8
+seriesPart: 9
 seeAlso: ["code-rag-rechunk-reindex-reembed", "code-rag-document-registry"]
 ---
 
-*Part 8 of the Code RAG series. Parts 1–7 built a RAG pipeline that indexes correctly and stays fresh. This post covers the one operational problem that none of that solves: what happens to live queries while you're rebuilding the index.*
+*Part 9 of the Code RAG series. Parts 1–8 built a RAG pipeline that indexes correctly and stays fresh. This post covers the one operational problem that none of that solves: what happens to live queries while you're rebuilding the index.*
 
 ---
 
@@ -211,4 +211,4 @@ Run this whenever a chunking strategy or embedding model change is deployed. Inc
 
 ---
 
-*Next: Part 9 — incremental indexing via git diff: instead of re-scanning the full file tree, read `git diff HEAD~1` and update only the files that changed in the last commit.*
+*Next: Part 10 — incremental indexing via git diff: instead of re-scanning the full file tree, read `git diff HEAD~1` and update only the files that changed in the last commit.*

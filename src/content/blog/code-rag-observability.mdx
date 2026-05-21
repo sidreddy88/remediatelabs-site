@@ -5,11 +5,11 @@ date: 2026-05-19
 tags: ["rag", "architecture", "debugging"]
 readTime: 9
 series: "Code RAG in Production"
-seriesPart: 9
+seriesPart: 10
 seeAlso: ["code-rag-alias-deployment"]
 ---
 
-*Part 9 of the Code RAG series. Parts 1–8 built a pipeline that indexes correctly, retrieves relevantly, and rebuilds safely. This post covers the failure mode that none of that prevents: answers that are wrong in ways you cannot see.*
+*Part 10 of the Code RAG series. Parts 1–9 built a pipeline that indexes correctly, retrieves relevantly, and rebuilds safely. This post covers the failure mode that none of that prevents: answers that are wrong in ways you cannot see.*
 
 ---
 
@@ -289,4 +289,4 @@ Alert on `eval.faithfulness` p50 dropping below your acceptable floor — for co
 
 ---
 
-*This post completes the nine-part Code RAG series. Starting from a line-count chunker that split functions across arbitrary windows, we built: structural diagnosis of two failure modes, function-boundary extraction, LLM-generated descriptions, hybrid search, a document registry, three-way decision logic for re-chunking vs re-embedding vs re-indexing, alias-based zero-downtime rebuilds, and end-to-end retrieval tracing. Every change was measured against real code from a production codebase.*
+*This post completes the ten-part Code RAG series. Starting from a line-count chunker that split functions across arbitrary windows, we built: structural diagnosis of two failure modes, function-boundary extraction, LLM-generated descriptions, hybrid search, cross-encoder re-ranking, a document registry, three-way decision logic for re-chunking vs re-embedding vs re-indexing, alias-based zero-downtime rebuilds, and end-to-end retrieval tracing. Every change was measured against real code from a production codebase.*
