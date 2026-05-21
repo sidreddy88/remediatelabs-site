@@ -21,12 +21,11 @@ const pipelineChart = `flowchart TB
     K -- LOW/MED --> L[Human approval]
     K -- HIGH/CRIT --> L
     L --> M[Merge]
-    M --> N[MonitorGenerationAgent<br/>new alarms for changed code]
     classDef event fill:#0b0d10,stroke:#2f343b,color:#e6e8eb
     classDef agent fill:#13161a,stroke:#6ee7b7,color:#e6e8eb
     classDef gate fill:#0b0d10,stroke:#23272d,color:#9aa1a9
     class A,X event
-    class E,F,G,I,N agent
+    class E,F,G,I agent
     class D,H,K gate`;
 
 const deploymentChart = `flowchart LR
@@ -63,7 +62,6 @@ const agents = [
   { name: "DiagnosisAgent", role: "Roots every claim against the live repo via GitHub Code Search.", pattern: "ReAct + grounding guards" },
   { name: "FixGenerationAgent", role: "Writes the patch. Runs it in a Docker sandbox. Retries 3× on test failure.", pattern: "Direct LLM + sandbox loop" },
   { name: "CodeReviewAgent", role: "Self-critique pass before opening the PR. Catches obvious regressions.", pattern: "Direct LLM" },
-  { name: "MonitorGenerationAgent", role: "On PR merge, generates new CloudWatch alarms for new code paths.", pattern: "ReAct + dry-run tools" },
 ];
 ---
 
@@ -77,7 +75,7 @@ const agents = [
       agent-platform
     </h1>
     <p class="text-muted text-lg mt-4 max-w-3xl leading-relaxed">
-      A 6-agent pipeline that detects production crashes, grounds the diagnosis against the actual
+      A 5-agent pipeline that detects production crashes, grounds the diagnosis against the actual
       repo, generates a patch, validates it in a Docker sandbox, and opens a PR — with a human
       approval gate before any merge, escalating urgency for HIGH/CRITICAL severity.
     </p>
