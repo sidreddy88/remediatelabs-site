@@ -1,0 +1,237 @@
+---
+title: "Cross-Encoder Re-Ranking — From Top-3 to Rank 1"
+tagline: "The vocabulary gap query is at rank 3. Five functions have identical lexical scores — vector can't break the tie. Cross-encoder re-ranking sees query and document together and pushes the correct function to rank 1."
+date: 2026-05-28
+tags: ["rag", "architecture", "debugging"]
+readTime: 8
+series: "Code RAG in Production"
+seriesPart: 6
+seeAlso: ["code-rag-hybrid-search", "rag-cross-encoder-reranking"]
+---
+
+*Part 6 of the Code RAG series. Part 5 applied hybrid search to push the vocabulary gap query from rank 7 to rank 3. The correct function is now in the top 3 — but not at rank 1, and all five functions at the top share an identical lexical score. This post applies cross-encoder re-ranking to resolve the tie.*
+
+---
+
+## Where we left off
+
+After five parts, the hardest query is still not fully solved:
+
+```
+Query: "S3 NoSuchKey missing key error"
+
+Part 2 (line-based):            not found
+Part 3 (function-boundary):     not found
+Part 4 (enriched descriptions): rank 7, score 0.28
+Part 5 (hybrid search):         rank 3, score 0.44
+```
+
+Rank 3 is progress. The function is inside the top-3 cutoff. But look at the top-5 results after hybrid search:
+
+```
+rank 1  hybrid=0.4602  vec=0.3146  lex=0.80  UploadOriginaltoS3
+rank 2  hybrid=0.4526  vec=0.3037  lex=0.80  getImagesDimensions
+rank 3  hybrid=0.4377  vec=0.2824  lex=0.80  moveAndRemoveFileFromS3 ◀ TARGET
+rank 4  hybrid=0.4376  vec=0.2823  lex=0.80  fixFailedCompressedImages
+rank 5  hybrid=0.4373  vec=0.2818  lex=0.80  generateThumbnailAndUploadtoS3
+```
+
+Every function in the top 5 has a lexical score of 0.80 — four of five query tokens (`s3`, `key`, `error`, `nosuchkey`) match every S3 function in the codebase. Lexical is done. It can't distinguish further.
+
+The tie-breaker is vector score, and vector is getting it wrong. `UploadOriginaltoS3` has a higher vector score (0.3146) than `moveAndRemoveFileFromS3` (0.2824) because its generated description happened to land closer to "S3 NoSuchKey missing key error" in embedding space — even though it has nothing to do with NoSuchKey errors.
+
+The gap between rank 1 and rank 3 is 0.022. That's not a signal. That's noise in the embedding space.
+
+---
+
+## Why vector search can't break this tie
+
+Vector retrieval uses bi-encoders: the query is embedded independently, each document is embedded independently, and similarity is the cosine angle between two separate vectors.
+
+```
+query  → [embed] → vector_q
+doc    → [embed] → vector_d
+similarity = cosine(vector_q, vector_d)
+```
+
+The key constraint: the embeddings are independent. The query embedding has no knowledge of any specific document. The document embedding has no knowledge of any specific query. When two documents are semantically similar to each other and both loosely related to the query, their vector scores cluster together and you can't distinguish them.
+
+For the vocabulary gap query, the problem is concrete. The query "S3 NoSuchKey missing key error" is about an error condition. The correct function's description contains "handling NoSuchKey errors" — it's about a function that explicitly catches that error. `UploadOriginaltoS3`'s description talks about "generating a signed S3 URL" and "uploading a buffer to S3." Those are different operations.
+
+A human reading both descriptions alongside the query would immediately know which one is more relevant. Bi-encoder vector similarity can't make that judgment — it can only measure geometric proximity between pre-computed vectors.
+
+---
+
+## What cross-encoder re-ranking does differently
+
+Cross-encoders take the query and document together as a single input and output a direct relevance score:
+
+```
+[query] [SEP] [document] → transformer → relevance score
+```
+
+The model attends to both at the same time. It can see that "NoSuchKey error" in the query matches "handling NoSuchKey errors" in the target function's description. It can see that `UploadOriginaltoS3` is about uploads, not error handling. It produces a score that directly answers: "how relevant is this document to this query?"
+
+This is fundamentally more accurate than bi-encoder similarity. The trade-off is speed: cross-encoder scores can't be pre-computed because the score depends on the query. Every query requires running inference over every candidate document. That's why cross-encoders are used for re-ranking a shortlist, not for searching the full corpus.
+
+---
+
+## The two-stage architecture
+
+The right pattern is the same as Incident RAG Part 6:
+
+**Stage 1 — Hybrid retrieval (recall)**
+
+Fetch the top K candidates using hybrid search. The goal is recall: don't miss the correct function. Fetch more than the final top-N you need — 20 candidates instead of 3. Apply no score threshold here; let stage 2 decide.
+
+**Stage 2 — Cross-encoder re-ranking (precision)**
+
+Run each `(query, candidate)` pair through the cross-encoder. Re-sort by cross-encoder score. Return the top 3.
+
+```
+full codebase (N functions)
+    → hybrid search → top 20 candidates
+    → cross-encoder → top 3 (re-ranked)
+```
+
+Stage 1 is fast: one embedding call + one ANN lookup + lexical scoring over the corpus. Stage 2 runs 20 cross-encoder inference calls — small enough to be synchronous.
+
+---
+
+## The implementation
+
+```python
+from sentence_transformers import CrossEncoder
+
+async def rerank_functions(
+    self,
+    query: str,
+    n_results: int = 3,
+    candidate_pool: int = 20,
+) -> list[dict]:
+    # Stage 1: hybrid retrieval — wide candidate set, no score floor
+    candidates = await self.hybrid_search(query, n_results=candidate_pool, min_score=0.0)
+    if not candidates:
+        return []
+
+    # Stage 2: cross-encoder re-ranking
+    if not hasattr(self, "_cross_encoder"):
+        self._cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    ce = self._cross_encoder
+
+    pairs = [(query, r["text"]) for r in candidates]
+    ce_scores = ce.predict(pairs)
+
+    for r, ce_score in zip(candidates, ce_scores):
+        r["ce_score"] = round(float(ce_score), 4)
+        r["hybrid_score"] = r.pop("score")
+
+    reranked = sorted(candidates, key=lambda x: x["ce_score"], reverse=True)
+    return reranked[:n_results]
+```
+
+Three decisions worth noting:
+
+**`min_score=0.0` in stage 1.** Score thresholds at retrieval time exclude documents before the cross-encoder can evaluate them. If the correct function has a hybrid score of 0.41 and you apply `min_score=0.45`, the cross-encoder never sees it. Fetch wide, filter late.
+
+**Cache the model.** `CrossEncoder(...)` loads ~90MB of weights. The `hasattr` check initialises it once. In production, move this to `__init__`.
+
+**Keep both scores.** The result dict now has `hybrid_score` (the stage 1 hybrid value) and `ce_score` (the cross-encoder output). Keeping both is important for debugging — when a result surprises you, you can see which stage drove it.
+
+---
+
+## The results
+
+```
+Query                               Hybrid rank  CE rank  CE score
+-------------------------------------------------------------------
+moveAndRemoveFileFromS3                       1        1    +9.81
+copy S3 object then delete source             1        1    +9.14
+S3 copyObject deleteObject bucket key         1        1    +9.43
+S3 NoSuchKey missing key error                3        1    +8.31
+```
+
+The vocabulary gap query moved from rank 3 to rank 1. For the first time in the series, all four queries return the correct function at rank 1.
+
+---
+
+## Breaking down the NoSuchKey result
+
+The top-5 cross-encoder scores for the vocabulary gap query:
+
+```
+CE rank  CE score  Function
+-----------------------------------------------------------
+      1    +8.31   moveAndRemoveFileFromS3          ◀ TARGET
+      2    +2.14   UploadOriginaltoS3
+      3    -1.83   getImagesDimensions
+      4    -2.07   fixFailedCompressedImages
+      5    -2.31   generateThumbnailAndUploadtoS3
+```
+
+The cross-encoder saw "S3 NoSuchKey missing key error" alongside the `moveAndRemoveFileFromS3` description — "Copies an S3 object to a new location using AWS S3 API, then deletes the original, handling NoSuchKey errors thrown when the source key is missing" — and scored it +8.31. It saw the same query alongside `UploadOriginaltoS3` — a function that generates signed URLs and uploads buffers — and scored it +2.14.
+
+The gap is 6.17 points. In vector space the gap was 0.022. The cross-encoder has 280× more discriminating power on this query.
+
+`getImagesDimensions`, `fixFailedCompressedImages`, and `generateThumbnailAndUploadtoS3` all score negative — the cross-encoder is confident they're not relevant to a NoSuchKey error query, even though they all matched lexically (each contains "s3", "key", and "error" in the code or description).
+
+---
+
+## Score spread: vector vs cross-encoder
+
+For the vocabulary gap query, the full top-5 comparison:
+
+```
+Function                         Vec score  CE score
+-----------------------------------------------------
+moveAndRemoveFileFromS3             0.2824    +8.31
+UploadOriginaltoS3                  0.3146    +2.14
+getImagesDimensions                 0.3037    -1.83
+fixFailedCompressedImages           0.2823    -2.07
+generateThumbnailAndUploadtoS3      0.2818    -2.31
+```
+
+Vector scores span 0.2818 to 0.3146 — a range of 0.033. Cross-encoder scores span -2.31 to +8.31 — a range of 10.6 points.
+
+**The cross-encoder's signal is 320× wider.** That's the practical difference: vector similarity compresses everything into a narrow band where small differences between rank 1 and rank 3 are indistinguishable from noise. The cross-encoder produces a score where +8 means "clearly relevant" and -2 means "clearly not" — separations you can reason about and threshold confidently.
+
+---
+
+## Why `UploadOriginaltoS3` fooled the vector search
+
+`UploadOriginaltoS3` ranked above `moveAndRemoveFileFromS3` in vector space (0.3146 vs 0.2824) even though it has nothing to do with NoSuchKey errors. Why?
+
+Its LLM-generated description includes phrases like "uploads the buffer to S3 using `putObject`" and "handles S3 upload errors." The word "error" appears in the context of upload error handling — semantically adjacent to "error condition" in general. The embedding model has seen enough training data to know that "S3 error" and "NoSuchKey error" are related concepts, so the description lands slightly closer to the query vector.
+
+This is a real limitation of LLM-generated descriptions: the description captures what the function does correctly, but "does X while handling errors" will create semantic overlap with any error-related query, not just the specific error the function handles.
+
+The cross-encoder caught this. Reading the query and the `UploadOriginaltoS3` description together, it could tell that "NoSuchKey missing key error" is asking about a key-not-found condition, and `UploadOriginaltoS3` is about uploading — no matter how many times "error" appears in both.
+
+---
+
+## The complete journey
+
+```
+                    Line    Fn-bndry  Enriched  Hybrid   CE
+────────────────────────────────────────────────────────────
+function name       r1 .56  r1 .709   r1 .675   r1 .772  r1
+natural language    r3 .50  r1 .572   r1 .572   r1 .700  r1
+API call names      r4 .50  r2 .597   r2 .614   r1 .730  r1
+NoSuchKey error     –       –         r7 .282   r3 .438  r1
+```
+
+Six steps, each fixing something measurable:
+
+**Part 2 (baseline):** Identified two failure modes — dilution from fixed-size chunking, vocabulary gap from missing terminology.
+
+**Part 3 (function-boundary chunks):** Fixed dilution. Each function gets its own chunk; the embedding is undiluted. Function name query jumped from 0.56 to 0.71.
+
+**Part 4 (LLM descriptions):** Fixed the vocabulary gap for the first time. Appending a generated description containing "NoSuchKey" made the target function visible at rank 7.
+
+**Part 5 (hybrid search):** Added lexical scoring. Exact token match on "NoSuchKey" pushed rank 7 → rank 3 with a hybrid score of 0.44.
+
+**Part 6 (cross-encoder re-ranking):** Fixed the tie at the top. Five functions had identical lexical scores; vector couldn't discriminate. Cross-encoder re-ranking read query and document together, correctly scored `moveAndRemoveFileFromS3` highest, and pushed it to rank 1.
+
+---
+
+*Next: Part 7 — the Document Registry: what happens when the codebase changes and the index goes stale.*

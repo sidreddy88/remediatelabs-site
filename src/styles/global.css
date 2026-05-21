@@ -41,7 +41,7 @@
 
 @layer components {
   .container-prose {
-    @apply mx-auto max-w-2xl px-6;
+    @apply mx-auto max-w-[750px] px-6;
   }
   .container-wide {
     @apply mx-auto max-w-5xl px-6;
