@@ -9,19 +9,19 @@ seriesPart: 1
 seeAlso: []
 ---
 
-*A new series alongside the Incident RAG posts. Same production codebase — AllInterviews, a Node.js/Express backend with 422 JS/TS files. Different problem: indexing source code for semantic search so agents can find relevant code when diagnosing and fixing bugs.*
+*Code RAG on a real production codebase — AllInterviews, a Node.js/Express backend with 422 JS/TS files. The problem: indexing source code for semantic search so agents can find relevant code when diagnosing and fixing bugs.*
 
 ---
 
-## Why code RAG is different from incident RAG
+## Why code is hard to index
 
-The incident RAG series indexed short, dense documents — each one a formatted string like:
+Incident RAG has it easy. Each document is a purpose-built retrieval target — a formatted string like:
 
 ```
 S3_NO_SUCH_KEY: S3 throws NoSuchKey on missing key | Root cause: The copyObject call fails when the source key doesn't exist before the move completes
 ```
 
-Every document was purpose-built for retrieval. One incident, one text, written in natural language about what went wrong.
+One incident, one text, written in natural language about what went wrong. The document was designed to be found.
 
 Code RAG indexes source files. A source file is not a document — it's hundreds or thousands of lines written for a compiler, not a search engine. Functions share files. Files share modules. A single file can contain ten unrelated functions, a hundred imported names, and boilerplate that's identical across every file in the repo.
 

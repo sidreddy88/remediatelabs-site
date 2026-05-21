@@ -162,7 +162,7 @@ Rank 7 is not good enough for a top-3 cutoff. But it's better than not found, wh
 
 **Separate description chunk.** Instead of appending the description to the code, store the description as a separate chunk with the function name as metadata. Now there are two chunks per function: one with the code (for code-style queries), one with the description (for incident-style queries). The right chunk surfaces for each query type without trade-offs.
 
-**Hybrid search.** Apply the same token-overlap lexical boost from the incident RAG series. "NoSuchKey" appears in the enriched text → lexical score 1.0. Even if the vector score is 0.28, the hybrid score would be `0.7 × 0.28 + 0.3 × 1.0 = 0.496` — enough to rank higher than chunks with higher vector scores but no lexical match.
+**Hybrid search.** Apply a token-overlap lexical boost alongside the vector score. "NoSuchKey" appears in the enriched text → lexical score 1.0. Even if the vector score is 0.28, the hybrid score would be `0.7 × 0.28 + 0.3 × 1.0 = 0.496` — enough to rank higher than chunks with higher vector scores but no lexical match.
 
 ---
 
