@@ -117,7 +117,7 @@ import BaseLayout from "../layouts/BaseLayout.astro";
 const CODE_CHUNKS = [
   {
     id: 'move_441',
-    name: 'chunk_441 · s3-helpers.js:441',
+    name: 'chunk 441',
     isTarget: true,
     lineOnly: true,
     file: 's3-helpers.js',
@@ -136,7 +136,7 @@ async function moveAndRemoveFileFromS3(bucket, imageObj) {
   },
   {
     id: 'move_481',
-    name: 'chunk_481 · s3-helpers.js:481',
+    name: 'chunk 481',
     isTarget: true,
     lineOnly: true,
     file: 's3-helpers.js',
@@ -406,9 +406,9 @@ async function deleteFileFromS3(key, bucketName) {
 // move_441 / move_481 are line-only chunks — only vecLine is used (fnOnly `move` handles fn-boundary stages)
 // vecLine values set so line-based rankings match blog: Q1→r1, Q2→r3/r4, Q3→r4, Q4→not found
 const CODE_SCORES = {
-  q1: { // "moveAndRemoveFileFromS3" — chunk_441 r1 ✓
+  q1: { // "moveAndRemoveFileFromS3" — chunk_441 r1 ✓, chunk_481 not in top 5 ✓
     move_441:  [0.560, 0, 0, 0, 0, 0],
-    move_481:  [0.420, 0, 0, 0, 0, 0],
+    move_481:  [0.290, 0, 0, 0, 0, 0],
     move:      [0.000, 0.709, 0.675, 1.00, 1.00, +9.81], // ✓ fn-boundary stages
     upload:    [0.390, 0.430, 0.425, 0.25, 0.25, +0.85],
     dimensions:[0.325, 0.360, 0.355, 0.00, 0.00, -3.20],
@@ -657,8 +657,7 @@ function renderResults(results) {
         <div class="rank-badge rank-${Math.min(r.rank, 99)} ${r.rank > 3 ? 'rank-other' : ''}">${r.rank}</div>
         <div class="flex-1 min-w-0">
           <div class="flex items-center gap-2 mb-1">
-            <span class="font-mono text-sm ${isTarget ? 'text-accent font-semibold' : 'text-ink'}">${r.chunk.name}</span>
-            ${isTarget ? '<span class="text-xs bg-accent/10 text-accent border border-accent/30 px-1.5 py-0.5 rounded">target</span>' : ''}
+            <span class="font-mono text-sm ${isTarget ? 'text-accent font-semibold' : 'text-ink'}">${isTarget ? 'Target ' : ''}${r.chunk.name}</span>
             <span class="text-xs font-mono text-muted ml-auto">rank ${r.rank}</span>
           </div>
           ${scoreBreakdown}
