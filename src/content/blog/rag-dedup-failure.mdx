@@ -72,10 +72,15 @@ CloudWatch log formatting is not consistent. Normalization that doesn't handle w
 
 Even with Layer 1 missing the match, Layer 3 (RAG) should have caught the duplicate. It didn't run.
 
-The code was:
+To understand why, the distinction between Layer 2 and Layer 3 matters:
+
+- **Layer 2** queries for *resolved* incidents — past errors that were fixed and closed. Its job is regression detection: if the same error type was resolved before and is now re-occurring, inject that context into the triage prompt.
+- **Layer 3** (RAG) searches for *open* incidents — currently active ones. Its job is duplicate detection: if there's already an open incident with a PR, drop the incoming event entirely.
+
+These are two different questions about two different populations. The bug was that the code treated an answer to the first question as a reason to skip the second.
 
 ```python
-# Layer 2
+# Layer 2 — queries resolved incidents
 past = incident_store.get_resolved_for_error(error_type, service)
 if past:
     prior_context = "REGRESSION: ..."
@@ -86,9 +91,9 @@ if prior_context is None and self._rag is not None:
     ...
 ```
 
-There was a previously resolved incident for the same error type and service. Layer 2 found it, set `prior_context`, and short-circuited Layer 3. RAG never ran.
+There was a previously resolved incident for the same error type and service. Layer 2 found it, correctly set `prior_context`, and moved on. But that `if prior_context is None` guard meant Layer 3 never ran — and Layer 3 was the only check that would have found the currently open incident with an active PR.
 
-The intent was reasonable: if Layer 2 already has context, skip the expensive embedding call. The side effect: RAG could never catch open duplicates when a regression was detected simultaneously. The two conditions — "this looks like a regression" and "there's already an open PR for this" — are not mutually exclusive. The architecture treated them as if they were.
+Layer 2 did its job correctly. The problem was the implicit assumption baked into the guard: that "Layer 2 found regression context" and "Layer 3 might find an open duplicate" are mutually exclusive. They aren't. An error can have a prior resolved incident *and* a currently open PR at the same time — which is exactly the situation here.
 
 **Fix:** RAG runs unconditionally, regardless of what Layer 2 found. The embedding call is cheap compared to running the full pipeline on a duplicate incident.
 
