@@ -416,9 +416,9 @@ const CODE_SCORES = {
     thumbnail: [0.305, 0.345, 0.340, 0.25, 0.25, -2.90],
     delete:    [0.355, 0.395, 0.388, 0.50, 0.50, +1.20],
   },
-  q2: { // "copy S3 object then delete source" — chunk_441 r3, chunk_481 r4 ✓
+  q2: { // "copy S3 object then delete source" — chunk_441 r3 (0.5035) ✓, chunk_481 r4 (0.4353) ✓
     move_441:  [0.503, 0, 0, 0, 0, 0], // r3 ✓
-    move_481:  [0.498, 0, 0, 0, 0, 0], // r4 ✓
+    move_481:  [0.435, 0, 0, 0, 0, 0], // r4 ✓ (blog score 0.4353)
     move:      [0.000, 0.572, 0.572, 1.00, 1.00, +9.14], // ✓
     upload:    [0.520, 0.465, 0.460, 0.40, 0.40, +1.30], // r2 in line-mode
     dimensions:[0.330, 0.370, 0.365, 0.20, 0.20, -2.80],
@@ -426,25 +426,25 @@ const CODE_SCORES = {
     thumbnail: [0.315, 0.355, 0.348, 0.40, 0.40, -1.90],
     delete:    [0.540, 0.425, 0.420, 0.80, 0.80, +2.10], // r1 in line-mode
   },
-  q3: { // "S3 copyObject deleteObject bucket key" — chunk_441 r4 ✓
+  q3: { // "S3 copyObject deleteObject bucket key" — chunk_441 r4 ✓, chunk_481 not in top 5 ✓
     move_441:  [0.502, 0, 0, 0, 0, 0], // r4 ✓
-    move_481:  [0.495, 0, 0, 0, 0, 0], // r5
-    move:      [0.000, 0.597, 0.614, 1.00, 1.00, +9.43], // ✓
+    move_481:  [0.310, 0, 0, 0, 0, 0], // r7 — not in top 5 ✓
+    move:      [0.000, 0.597, 0.614, 1.00, 1.00, +9.43], // ✓ fn-boundary r2, enriched r2, hybrid r1
     upload:    [0.525, 0.455, 0.450, 0.20, 0.20, +0.60], // r2 in line-mode
     dimensions:[0.340, 0.380, 0.375, 0.20, 0.20, -2.50],
     fix:       [0.315, 0.353, 0.347, 0.20, 0.20, -3.10],
     thumbnail: [0.510, 0.362, 0.355, 0.20, 0.20, -2.60], // r3 in line-mode
-    delete:    [0.535, 0.415, 0.408, 0.40, 0.40, +1.80], // r1 in line-mode
+    delete:    [0.535, 0.640, 0.640, 0.40, 0.40, +1.80], // r1 line ✓; fn-boundary r1 ✓ (deleteImageVariantsFromS3); enriched r1 ✓
   },
-  q4: { // "S3 NoSuchKey missing key error" — not found in line-mode ✓
-    move_441:  [0.195, 0, 0, 0, 0, 0], // r6 (effectively not found)
-    move_481:  [0.190, 0, 0, 0, 0, 0], // r7 — outside top 6
-    move:      [0.000, 0.248, 0.282, 0.60, 0.80, +8.31], // ✓ enriched=0.282 ✓
-    upload:    [0.270, 0.255, 0.315, 0.40, 0.80, +2.14], // ✓ hybrid vec=0.3146 ✓
-    dimensions:[0.290, 0.245, 0.304, 0.40, 0.80, -1.83], // ✓ hybrid vec=0.3037 ✓
-    fix:       [0.265, 0.242, 0.283, 0.40, 0.80, -2.07], // ✓ hybrid vec=0.2823 ✓
-    thumbnail: [0.280, 0.240, 0.282, 0.40, 0.80, -2.31], // ✓ hybrid vec=0.2818 ✓
-    delete:    [0.260, 0.262, 0.295, 0.60, 0.80, +4.20],
+  q4: { // "S3 NoSuchKey missing key error" — not found in all pre-hybrid stages ✓
+    move_441:  [0.195, 0, 0, 0, 0, 0], // r6 — not in top 5 ✓
+    move_481:  [0.190, 0, 0, 0, 0, 0], // r7 — not in top 5 ✓
+    move:      [0.000, 0.200, 0.283, 0.60, 0.80, +8.31], // fn-boundary r6 (not in top 5) ✓; hybrid r3 ✓; CE r1 ✓
+    upload:    [0.270, 0.255, 0.315, 0.40, 0.80, +2.14], // ✓ hybrid vec=0.3146, hybrid r1 ✓
+    dimensions:[0.290, 0.245, 0.304, 0.40, 0.80, -1.83], // ✓ hybrid vec=0.3037, hybrid r2 ✓
+    fix:       [0.265, 0.242, 0.282, 0.40, 0.80, -2.07], // hybrid vec=0.2823, hybrid r4 ✓
+    thumbnail: [0.280, 0.240, 0.282, 0.40, 0.80, -2.31], // ✓ hybrid vec=0.2818, hybrid r5 ✓
+    delete:    [0.260, 0.262, 0.265, 0.60, 0.80, -3.50], // not in hybrid top 5 ✓; not in CE top 5 ✓
   },
 };
 
