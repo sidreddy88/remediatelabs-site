@@ -1,0 +1,177 @@
+---
+title: "Why Your Indexed Text Is Killing Your Search"
+tagline: "My RAG pipeline was returning wrong results with no errors, no warnings, and no obvious cause. The bug was in what I was putting into the vectors before calling the embedding API."
+date: 2026-04-10
+tags: ["rag", "debugging", "architecture"]
+readTime: 7
+series: "Incident RAG in Production"
+seriesPart: 1
+seeAlso: ["rag-metadata-dedup"]
+---
+
+*Part 1 of a series on building and debugging RAG systems on a real production codebase.*
+
+---
+
+## The setup
+
+I run an AI agent platform that monitors a production Node.js app for errors. When an error is detected, a diagnosis agent searches a vector database of past incidents to find similar ones — "have we seen this before? What fixed it?" — and uses those as context before generating a fix.
+
+The pipeline: error detected → embed the error description → cosine similarity search against ~70 indexed past incidents → pass top matches to the LLM as context.
+
+Seemed reasonable. Then I actually looked at what was being indexed.
+
+---
+
+## What I found in the vector database
+
+Here's what one of my indexed incident documents looked like:
+
+```
+TYPEERROR in TaskAllInterviews | TYPEERROR | TaskAllInterviews |
+Error-> uncaughtException TypeError: Cannot read properties of
+undefined (reading 'publish_decision') /app/consumers/... |
+Root cause: ... | Fix: ...
+```
+
+Notice anything? The error type appears three times before the actual error message:
+
+1. `TYPEERROR in TaskAllInterviews` — the title field (error_type + service)
+2. `TYPEERROR` — the error_type field again
+3. `TaskAllInterviews` — the service field again
+
+This is what I call **boilerplate dominance**: a large chunk of every indexed document is identical across all documents. Every single incident starts with `{ERROR_TYPE} in TaskAllInterviews | {ERROR_TYPE} | TaskAllInterviews | Error-> ...`.
+
+---
+
+## Why this is a problem — the intuition
+
+When you call `text-embedding-3-small` with a string, you get back a vector of 1536 numbers representing the meaning of the text in high-dimensional space. The position in that space is determined by all the words in the string together — a weighted average of all their semantic contributions.
+
+Think of it like mixing paint. If your text is 80% blue words and 20% red words, your vector lands somewhere in the blue region, slightly pulled toward red. The more blue words, the more blue your vector is.
+
+Now imagine every document in your corpus has the same 15 "blue" words at the start before it gets to the actual content. Every vector gets pulled toward that same blue direction — regardless of what the actual content says. Documents that should be far apart end up clustered together.
+
+---
+
+## Measuring the damage
+
+The metric is cosine similarity: 1.0 means identical vectors, 0.0 means completely unrelated.
+
+**Test 1: Same error, raw query vs boilerplate-wrapped indexed doc**
+
+- Query: `Cannot read properties of undefined reading publish_decision`
+- Indexed: `TYPEERROR in TaskAllInterviews | TYPEERROR | TaskAllInterviews | Error-> uncaughtException TypeError: Cannot read properties of undefined (reading 'publish_decision')`
+
+Score: **0.71**
+
+String B contains String A verbatim. They should score near 1.0. The boilerplate prefix ate 29 percentage points of signal. My retrieval threshold was 0.80 — this incident was being silently excluded from results even though it was the right answer.
+
+**Test 2: Pure boilerplate vs a completely different error**
+
+- String A: `TYPEERROR in TaskAllInterviews | TYPEERROR | TaskAllInterviews | Error-> uncaughtException`
+- String B: `S3 NoSuchKey GetObject TaskAllInterviews`
+
+Score: **0.58**
+
+A TypeError and an S3 storage error have nothing in common. But because both documents reference `TaskAllInterviews`, the embedding sees them as 58% similar. Two different bugs looked like the same bug.
+
+**Test 3: Two different errors, both boilerplate-wrapped**
+
+- String A: `TYPEERROR in TaskAllInterviews | TYPEERROR | TaskAllInterviews | ...TypeError: Cannot read properties of undefined (reading 'host')`
+- String B: `S3_NO_SUCH_KEY in TaskAllInterviews | S3_NO_SUCH_KEY | TaskAllInterviews | ...NoSuchKey The specified key does not exist`
+
+Score: **0.51**
+
+Half similar. Different errors, different root causes, different fixes — but the embedding sees them as essentially the same document.
+
+---
+
+## The fix
+
+The root cause was in how I built the text before embedding it. Original code in `app/services/rag.py`:
+
+```python
+# Before — error_type and service repeated 3x
+text = (
+    f"{incident.error_event.title} | {incident.error_event.error_type} | "
+    f"{incident.error_event.service} | {incident.error_event.description[:200]} | "
+    f"Root cause: {incident.diagnosis}"
+)
+```
+
+The `title` field was `"{error_type} in {service}"` — so the first three pipe-separated segments were saying the same thing three ways before the actual error appeared.
+
+`error_type` and `service` are already stored as structured metadata fields on the vector store entry. They don't need to be embedded at all — you can filter on them without including them in the text. The embedding should be reserved for the differentiating content.
+
+```python
+# After — lead with what's actually different
+text = (
+    f"{incident.error_event.error_type}: {incident.error_event.description[:300]} | "
+    f"Root cause: {incident.diagnosis}"
+)
+```
+
+Three lines changed. The `error_type` prefix serves as a hint for type-level disambiguation (a TypeError description reads differently than an S3 error description), but it appears once, not three times. Then immediately into the actual error message.
+
+---
+
+## Measuring the lift
+
+| Comparison | Before | After | Delta |
+|---|---|---|---|
+| Same error: query vs indexed doc | 0.71 | 0.83 | +0.13 |
+| Different errors — false similarity A | 0.58 | 0.21 | −0.37 |
+| Different errors — false similarity B | 0.51 | 0.21 | −0.30 |
+
+Both directions improved simultaneously:
+
+- **Recall improved**: the right incident now scores 0.83, clearing the 0.80 threshold. Before the fix it was silently dropped.
+- **Precision improved**: unrelated errors dropped from ~0.55 false similarity to 0.21 — effectively noise.
+
+---
+
+## The general principle: signal density
+
+The lesson isn't specific to my error type field. The general principle is **signal density** — the fraction of your indexed text that actually differentiates one document from another.
+
+If your documents share a common structure, the embedding model treats that shared structure as part of the meaning. The more space it takes up, the more it pulls every document toward the same vector neighborhood.
+
+Before embedding, ask yourself: *if I removed this sentence, would a different document look meaningfully different?* If the answer is no — if every document has that sentence — it's boilerplate. Strip it.
+
+A few patterns to watch for:
+
+- **Repeated metadata fields**: error type, service name, environment — these belong in structured metadata, not in the embedded text
+- **Template headers**: "This incident was opened at 14:32 UTC on 2024-03-15 by service X" — all different, but all low-signal compared to the actual description
+- **System prompts baked into the text**: if you prepend "You are a helpful assistant..." to every chunk before embedding, you've made all your chunks equally helpful assistants
+- **File path boilerplate**: for code search, `# /app/services/rag.py` on every chunk is less useful than the actual code
+
+What you want to lead with is the most differentiating content — the part that's unique to this specific document.
+
+---
+
+## What this looked like before I measured it
+
+Before I ran these comparisons, I had no idea this was happening. The system was "working" — queries returned results, the LLM was generating responses. But:
+
+- The wrong incidents were appearing as context (high false similarity meant unrelated past incidents ranked highly)
+- The right incidents were missing (score 0.71 < 0.80 threshold = silently dropped)
+- The LLM was getting confused context that looked relevant but wasn't
+
+There was no error, no exception, no log warning. Just quietly degraded retrieval quality.
+
+This is why you need a measurement tool. Three comparisons took five minutes and revealed a real production bug.
+
+---
+
+## The takeaway
+
+RAG quality lives or dies in the preprocessing step. The embedding model doesn't know what's boilerplate and what's signal — it treats every token equally. You have to make that judgment before you call the API.
+
+If you're building a RAG system and haven't looked at what your indexed documents actually look like, open your vector database right now and read ten of them. Ask: "Does this look like the unique, differentiating content for this document?" If the first 20 words are the same on every document, you have this problem.
+
+**The fix is always the same: strip what's repeated, lead with what's different.**
+
+---
+
+*Next: Part 2 — outcome metadata in your embedded text, and why two incidents about the same bug can score 0.83 instead of 1.0.*
