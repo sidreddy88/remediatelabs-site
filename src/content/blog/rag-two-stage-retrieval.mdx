@@ -1,0 +1,178 @@
+---
+title: "Two-Stage Retrieval: Why Vector Search Alone Isn't Enough for Precision"
+tagline: "Vector search finds the neighborhood. Cross-encoder re-ranking finds the answer. Here's what that distinction costs, when it pays off, and when it doesn't."
+date: 2026-05-21
+tags: ["rag", "architecture", "debugging"]
+readTime: 9
+series: "RAG Learnings"
+seriesPart: 3
+seeAlso: ["rag-index-vs-live-store", "rag-dedup-failure"]
+---
+
+Vector search asks *"are these two things in the same neighborhood?"* Cross-encoder asks *"given this specific question, is this specific document the answer?"* — and it can tell the difference between "handles S3 errors including NoSuchKey" and "uploads to S3 and handles upload errors" in a way vector similarity cannot.
+
+That distinction matters more than it sounds. Here's what it costs, when it's worth it, and when it isn't.
+
+---
+
+## What vector search actually measures
+
+When you embed a query and search a vector index, you're measuring the angle between two points in high-dimensional space — typically 1536 dimensions for OpenAI's `text-embedding-3-small`. Close angle means similar meaning.
+
+The problem: most natural language texts land in a relatively narrow band of angles. Everything is "somewhat related" because all text shares common vocabulary and structure. Vector scores compress.
+
+Here's what top-5 results look like for a typical incident RAG query in production:
+
+```
+rank 1:  0.79  S3_NO_SUCH_KEY: S3 throws NoSuchKey on copyObject...
+rank 2:  0.66  SYNTAXERROR: Failed to parse model JSON...
+rank 3:  0.58  TYPEERROR: Cannot read properties of undefined...
+rank 4:  0.51  S3_NO_SUCH_KEY: another incident...
+rank 5:  0.51  S3_NO_SUCH_KEY: yet another...
+```
+
+The gap between rank 1 (correct) and rank 3 (wrong) is 0.21. Set `min_score = 0.80` and you lose the right answer. Set `min_score = 0.50` and you let in noise. There's no threshold that cleanly separates signal from noise at this scale.
+
+The code RAG series showed the same compression on function search — five S3 functions within a 0.022-point band for the query "S3 NoSuchKey missing key error," with the correct function at rank 3 and the wrong function at rank 1 by a margin indistinguishable from noise.
+
+---
+
+## Why a cross-encoder has more discriminating power
+
+Vector retrieval uses bi-encoders: embed query separately, embed document separately, measure cosine similarity between the two vectors.
+
+```
+query  → [embed] → vector_q
+doc    → [embed] → vector_d
+score  = cosine(vector_q, vector_d)
+```
+
+The embeddings are independent. `vector_q` has no knowledge of this specific document. `vector_d` has no knowledge of this specific query. Similarity is a geometric approximation: "are these two points close in space?"
+
+A cross-encoder works differently. It takes query and document together as a single input:
+
+```
+[query] [SEP] [document] → transformer → relevance score
+```
+
+The model attends to both simultaneously. It can see specific phrases in the query matching specific phrases in the document, the intent of the question matching the structure of the answer. The output is a direct relevance judgment — not a geometric approximation.
+
+For the NoSuchKey query in the code RAG series, the difference was concrete. After hybrid search, five S3 functions were essentially tied:
+
+```
+rank 1  hybrid=0.4602  UploadOriginaltoS3           ← uploads, not error handling
+rank 2  hybrid=0.4526  getImagesDimensions           ← dimensions, not errors
+rank 3  hybrid=0.4377  moveAndRemoveFileFromS3       ← TARGET: handles NoSuchKey
+rank 4  hybrid=0.4376  fixFailedCompressedImages
+rank 5  hybrid=0.4373  generateThumbnailAndUploadtoS3
+```
+
+Gap between rank 1 and rank 3: 0.022. After cross-encoder re-ranking:
+
+```
+rank 1  +8.31   moveAndRemoveFileFromS3             ← TARGET, now rank 1
+rank 2  +2.14   UploadOriginaltoS3
+rank 3  -1.83   getImagesDimensions
+rank 4  -2.07   fixFailedCompressedImages
+rank 5  -2.31   generateThumbnailAndUploadtoS3
+```
+
+Gap between rank 1 and rank 2: 6.17 points. The cross-encoder read "handling NoSuchKey errors" in the target function's description alongside "S3 NoSuchKey missing key error" in the query and recognized the match. It read "generates signed URL and uploads buffer" in `UploadOriginaltoS3` and scored it +2.14 — related but not the answer.
+
+The negative scores are meaningful too: the model is confident `getImagesDimensions` and `generateThumbnailAndUploadtoS3` are not relevant to a NoSuchKey error query, even though they all matched lexically.
+
+---
+
+## The cost breakdown
+
+This is where cross-encoders are misunderstood. The cost structure is fundamentally different from vector search.
+
+**Vector search cost at query time:**
+
+1. One embedding call for the query — ~20ms for `text-embedding-3-small`
+2. One ANN lookup in the vector index — ~1ms for a small corpus, ~10ms at scale
+3. Total: ~20ms, scales as O(1) regardless of corpus size
+
+Documents were embedded once at index time and cached. Query time is nearly free.
+
+**Cross-encoder cost at query time:**
+
+The cross-encoder *cannot* pre-compute scores. The score for `(query, doc)` pair depends on the specific query — there's nothing to pre-compute until you know what the query is. Every pair requires running a forward pass through the model.
+
+If you applied a cross-encoder to a full corpus of 5,000 functions:
+
+```
+5,000 pairs × ~15ms per inference = 75 seconds per query
+```
+
+That's unusable. Cross-encoders don't replace vector search. They re-rank a shortlist.
+
+**Two-stage architecture cost:**
+
+```
+Stage 1: hybrid retrieval → top 20 candidates     ~25ms
+Stage 2: cross-encoder    → 20 pairs re-scored    ~300ms
+Total:                                            ~325ms
+```
+
+The model I used — `cross-encoder/ms-marco-MiniLM-L-6-v2` — is 90MB, loads once on startup (cached via `hasattr` check), and runs 20 inference calls in a batch. The 300ms adds real latency to an LLM pipeline that's already measuring in seconds, so it's a meaningful but acceptable cost.
+
+A larger model like `ms-marco-MiniLM-L-12-v2` (150MB) would score more accurately at roughly double the inference time. The 6-layer model is the right starting point for most use cases.
+
+**The cost of not using it:**
+
+On a small, well-tuned corpus (7–10 incidents), vector search with hybrid scoring usually gets the right answer first. Cross-encoder re-ranking doesn't change rankings — it just widens the score spread.
+
+On a larger corpus where similar-but-wrong incidents exist, cross-encoder re-ranking catches rank inversions that vector scoring can't resolve. The 300ms latency pays for itself when the alternative is an agent operating on the wrong incident.
+
+---
+
+## What the score spread means in practice
+
+After hybrid search, the incident RAG pipeline produced scores like this for a correct match vs. noise:
+
+```
+Correct incident:    0.79  (cosine)
+Unrelated incident:  0.17  (cosine)
+Gap: 0.62
+```
+
+After cross-encoder:
+
+```
+Correct incident:   +7.85  (CE score)
+Unrelated incident: -11.34 (CE score)
+Gap: 19.19
+```
+
+**30× wider.** That's not just a better ranking — it's a score you can actually threshold. `ce_score > 0` reliably separates "relevant" from "not relevant" in a way `cosine > 0.5` cannot. Negative CE scores mean the model is actively confident of irrelevance, not just "less similar."
+
+---
+
+## When cross-encoder re-ranking is worth it
+
+**Precision-critical retrieval.** If you're returning top 3 results to an LLM and rank 1 matters (the agent acts on the first result), cross-encoder re-ranking is worth the latency. The 300ms cost is small relative to a full LLM inference call.
+
+**Dense semantic clusters.** When your corpus has many similar documents — multiple incidents of the same error type, multiple functions with similar names — vector scores compress into a band where thresholds fail. This is exactly where cross-encoders help.
+
+**Dedup is different.** My pipeline uses pure vector search for the deduplication gate (`min_score ≥ 0.90`), not two-stage retrieval. The reason: dedup only needs to know "is this the same incident?" and cosine ≥ 0.90 is a reliable signal for near-identical errors. Cross-encoder precision doesn't add much here, and the latency cost comes before triage, not during context retrieval. Different decision, different tool.
+
+---
+
+## When it isn't
+
+**Tiny corpora.** With fewer than ~20 documents, vector search is likely getting rank 1 correct already. Cross-encoder re-ranking is overhead without benefit.
+
+**When recall is the bottleneck.** If the right document isn't in the top 20 candidates from stage 1, the cross-encoder can't help — it only re-ranks what stage 1 retrieved. The fix is better chunking, richer indexed text, or hybrid search. Fix recall first.
+
+**Real-time streaming.** If you need sub-50ms response, cross-encoder re-ranking is a non-starter. Vector search is the only option at that latency budget.
+
+---
+
+## The one-sentence version
+
+Use vector search to find the 20 most plausible candidates from a large corpus. Use a cross-encoder to rank those 20 by reading the query and each document together — because reading both at once produces a 30× wider score signal than comparing two independently computed vectors.
+
+---
+
+*The implementation this post describes is in `app/services/rag.py` in the agent-platform repo. The Incident RAG series covers how the pipeline got here — starting from boilerplate-dominated indexed text, through hybrid search, to this two-stage architecture.*
