@@ -13,6 +13,12 @@ seeAlso: ["rag-dedup-failure", "rag-index-vs-live-store"]
 
 ---
 
+Vector search asks *"are these two things in the same neighborhood?"* Cross-encoder re-ranking asks *"given this specific question, is this specific document the answer?"* — and it can tell the difference between "handles S3 errors including NoSuchKey" and "uploads to S3 and handles upload errors" in a way vector similarity cannot.
+
+Here's why that distinction matters, and what it costs.
+
+---
+
 ## The problem vector search can't solve alone
 
 After five posts of fixes, my RAG pipeline was working well. The eval harness was passing 8/8. Retrieval scores were reasonable.

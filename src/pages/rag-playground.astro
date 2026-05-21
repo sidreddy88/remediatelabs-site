@@ -434,16 +434,16 @@ const CODE_SCORES = {
     dimensions:[0.340, 0.380, 0.375, 0.20, 0.20, -2.50],
     fix:       [0.315, 0.353, 0.347, 0.20, 0.20, -3.10],
     thumbnail: [0.510, 0.362, 0.355, 0.20, 0.20, -2.60], // r3 in line-mode
-    delete:    [0.535, 0.640, 0.640, 0.40, 0.40, +1.80], // r1 line ✓; fn-boundary r1 ✓ (deleteImageVariantsFromS3 outranks move); enriched r1 ✓
+    delete:    [0.535, 0.640, 0.640, 0.40, 0.40, +1.80], // r1 line ✓; fn-boundary r1 ✓ (deleteImageVariantsFromS3); enriched r1 ✓
   },
   q4: { // "S3 NoSuchKey missing key error" — not found in all pre-hybrid stages ✓
     move_441:  [0.195, 0, 0, 0, 0, 0], // r6 — not in top 5 ✓
     move_481:  [0.190, 0, 0, 0, 0, 0], // r7 — not in top 5 ✓
-    move:      [0.000, 0.200, 0.283, 0.60, 0.80, +8.31], // fn-boundary r6 (not in top 5) ✓; enriched/hybrid r3 ✓; CE r1 ✓
+    move:      [0.000, 0.200, 0.283, 0.60, 0.80, +8.31], // fn-boundary r6 (not in top 5) ✓; hybrid r3 ✓; CE r1 ✓
     upload:    [0.270, 0.255, 0.315, 0.40, 0.80, +2.14], // ✓ hybrid vec=0.3146, hybrid r1 ✓
     dimensions:[0.290, 0.245, 0.304, 0.40, 0.80, -1.83], // ✓ hybrid vec=0.3037, hybrid r2 ✓
-    fix:       [0.265, 0.242, 0.282, 0.40, 0.80, -2.07], // hybrid vec=0.2823 → 0.282, hybrid r4 ✓
-    thumbnail: [0.280, 0.240, 0.282, 0.40, 0.80, -2.31], // ✓ hybrid vec=0.2818 → 0.282, hybrid r5 ✓
+    fix:       [0.265, 0.242, 0.282, 0.40, 0.80, -2.07], // hybrid vec=0.2823, hybrid r4 ✓
+    thumbnail: [0.280, 0.240, 0.282, 0.40, 0.80, -2.31], // ✓ hybrid vec=0.2818, hybrid r5 ✓
     delete:    [0.260, 0.262, 0.265, 0.60, 0.80, -3.50], // not in hybrid top 5 ✓; not in CE top 5 ✓
   },
 };
