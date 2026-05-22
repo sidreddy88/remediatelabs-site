@@ -4,9 +4,7 @@ import DemoCTA from "../../components/DemoCTA.astro";
 import Mermaid from "../../components/Mermaid.astro";
 
 const pipelineChart = `flowchart TB
-    A([CloudWatch alarm]) --> B[SNS topic]
-    B --> C[/webhooks/cloudwatch-alarm/]
-    C --> D{Dedup gate}
+    A([CloudWatch Logs<br/>poll · 5 min]) --> D{Dedup gate}
     D -- duplicate --> X([drop])
     D -- new --> E[TriageAgent · Haiku]
     E -- noise --> X
@@ -36,14 +34,13 @@ const deploymentChart = `flowchart LR
     ECS --> S3[(S3<br/>artefacts)]
     GH[GitHub Actions OIDC] -. on push to main .-> ECR[ECR]
     ECR -. ECS pull .-> ECS
-    SNS[SNS topic] --> WH[/webhook handler/]
-    CW[CloudWatch alarms] --> SNS
+    CWLOGS[(CloudWatch Logs<br/>target app)] -. poll · 5 min .-> ECS
     classDef ext fill:#0b0d10,stroke:#23272d,color:#9aa1a9
     classDef compute fill:#13161a,stroke:#6ee7b7,color:#e6e8eb
     classDef store fill:#13161a,stroke:#2f343b,color:#e6e8eb
     class U,CF,GH ext
-    class ALB,ECS,WH compute
-    class PG,S3,ECR,SNS,CW store`;
+    class ALB,ECS compute
+    class PG,S3,ECR,CWLOGS store`;
 
 const stack = [
   { layer: "Agent runtime", value: "Anthropic SDK · Claude Opus 4.6 / Sonnet 4.6 / Haiku 4.5" },
@@ -171,9 +168,10 @@ const agents = [
     <h2 class="text-2xl font-semibold tracking-tight text-ink mb-6">Design decisions worth defending</h2>
     <ol class="space-y-5 text-muted leading-relaxed list-decimal list-inside">
       <li>
-        <strong class="text-ink">Push, not poll.</strong> CloudWatch alarms → SNS → HTTPS webhook.
-        Zero polling load on the production server. Detection latency drops from
-        ~7d (human attention) to single-digit minutes.
+        <strong class="text-ink">Poll the log destination, not the server.</strong>
+        <code class="text-accent">filter_log_events</code> against CloudWatch Logs every 5 minutes.
+        Zero traffic to the production container — CloudWatch is AWS-managed storage; reading from it
+        doesn't share capacity with real users. MTTD floor of 5 minutes; per-line log fidelity built in.
       </li>
       <li>
         <strong class="text-ink">RAG finds candidates. The live store confirms truth.</strong>
