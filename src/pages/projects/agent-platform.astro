@@ -10,12 +10,14 @@ const pipelineChart = `flowchart TB
     E -- noise --> X
     E -- duplicate --> X
     E -- real, P0–P3 --> F[DiagnosisAgent · Sonnet]
-    F --> G[FixGenerationAgent]
-    G --> H{Sandbox<br/>npm test}
+    F --> G[FixGenerationAgent · Sonnet]
+    G --> SC[Self-critique · Haiku]
+    SC -- LIKELY WRONG --> G
+    SC -- pass --> H{Sandbox<br/>npm test}
     H -- fail · retry 3× --> G
-    H -- pass --> I[CodeReviewAgent<br/>self-critique]
-    I --> J[Open GitHub PR]
-    J --> K{Risk}
+    H -- pass --> J[Open GitHub PR]
+    J --> I[CodeReviewAgent · GPT-4.1]
+    I --> K{Risk}
     K -- LOW/MED --> L[Human approval]
     K -- HIGH/CRIT --> L
     L --> M[Merge]
@@ -23,7 +25,7 @@ const pipelineChart = `flowchart TB
     classDef agent fill:#13161a,stroke:#6ee7b7,color:#e6e8eb
     classDef gate fill:#0b0d10,stroke:#23272d,color:#9aa1a9
     class A,X event
-    class E,F,G,I agent
+    class E,F,G,SC,I agent
     class D,H,K gate`;
 
 const deploymentChart = `flowchart LR
@@ -57,8 +59,8 @@ const agents = [
   { name: "IncidentResponseAgent", role: "Orchestrates the full pipeline. Receives error events, runs dedup checks, coordinates Triage → Diagnosis → Fix in sequence, and manages the approval gate.", pattern: "Orchestrator + tool chain" },
   { name: "TriageAgent", role: "Classifies events as real / noise / duplicate. P0–P3 severity. Haiku for cost.", pattern: "ReAct + typed wrapper" },
   { name: "DiagnosisAgent", role: "Roots every claim against the live repo via GitHub Code Search.", pattern: "ReAct + grounding guards" },
-  { name: "FixGenerationAgent", role: "Writes the patch. Runs it in a Docker sandbox. Retries 3× on test failure.", pattern: "Direct LLM + sandbox loop" },
-  { name: "CodeReviewAgent", role: "Self-critique pass before opening the PR. Catches obvious regressions.", pattern: "Direct LLM" },
+  { name: "FixGenerationAgent", role: "Writes the patch (Sonnet). Haiku self-critique rejects bad fixes before they hit the sandbox. Retries 3× on test failure.", pattern: "Direct LLM + critique + sandbox" },
+  { name: "CodeReviewAgent", role: "Posts a GPT-4.1 review to the opened PR. Cross-provider by design — the reviewer is enforced to be a different model family than the generator.", pattern: "Direct LLM · cross-provider" },
 ];
 ---
 
@@ -195,6 +197,12 @@ const agents = [
         <strong class="text-ink">Sandbox before PR.</strong> Every fix runs in a Docker
         container against the real test suite. If tests fail, regenerate up to 3× before
         opening any GitHub noise.
+      </li>
+      <li>
+        <strong class="text-ink">Cross-provider review.</strong> Fix generation uses Claude Sonnet;
+        code review uses GPT-4.1. Enforced at startup — the gateway raises on boot if both resolve
+        to the same provider. Different model families have different blind spots; the reviewer is
+        structurally incapable of being lenient with its own output.
       </li>
       <li>
         <strong class="text-ink">Approval gate before every merge.</strong> All PRs require
