@@ -196,13 +196,13 @@ The lesson: structural problems (chunking) and information problems (vocabulary 
 
 ## What this means for production
 
-A real production code RAG pipeline needs both:
+After Parts 3 and 4, the pipeline has two layers:
 
-1. **Function-boundary chunks** — extract functions properly, one chunk per function. Eliminates dilution. This is the high-leverage fix.
-2. **LLM-generated descriptions** — append a description that includes exact error names, external API dependencies, and edge cases. Closes the vocabulary gap partially.
-3. **Hybrid search** — add lexical token overlap to boost chunks where the error name appears literally. Combines well with enriched descriptions.
-4. **Separate description chunks** — for incident queries, the description vocabulary is more relevant than the code vocabulary. Storing each as a separate chunk with shared metadata avoids the trade-off between code-query and incident-query performance.
+1. **Function-boundary chunks** — one chunk per function, sized to the function. Eliminates dilution. This is the high-leverage fix and the prerequisite for everything else.
+2. **LLM-generated descriptions** — appended to each chunk at index time. Closes the vocabulary gap partially by adding error names and API dependencies the source code never mentions.
 
 The order matters. Don't add LLM-generated descriptions on top of line-based chunks — the dilution problem will swamp the description signal. Fix chunking first, then enrich.
+
+Rank 7 for the error query is progress, but it isn't good enough. Part 5 covers hybrid search — adding a lexical boost so chunks where the error name appears literally score higher regardless of their vector score.
 
 ---
