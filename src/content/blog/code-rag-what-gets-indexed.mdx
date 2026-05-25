@@ -15,13 +15,7 @@ seeAlso: []
 
 ## Why code is hard to index
 
-Incident RAG has it easy. Each document is a purpose-built retrieval target — a formatted string like:
-
-```
-S3_NO_SUCH_KEY: S3 throws NoSuchKey on missing key | Root cause: The copyObject call fails when the source key doesn't exist before the move completes
-```
-
-One incident, one text, written in natural language about what went wrong. The document was designed to be found.
+Some retrieval targets are easy. A support ticket, a bug report, a log entry — each is a purpose-built document written in natural language about one thing. It was designed to be found.
 
 Code RAG indexes source files. A source file is not a document — it's hundreds or thousands of lines written for a compiler, not a search engine. Functions share files. Files share modules. A single file can contain ten unrelated functions, a hundred imported names, and boilerplate that's identical across every file in the repo.
 
