@@ -1,0 +1,261 @@
+---
+title: "HyDE — Querying With Hypothetical Code Instead of the Error Message"
+tagline: "HyDE pushed the code-vocabulary queries from 0.77 to 0.84. The incident-vocabulary query got worse: rank 3 → rank 5. The hypothetical went in the wrong direction."
+date: 2026-05-26
+tags: ["rag", "architecture", "debugging"]
+readTime: 9
+series: "Code RAG in Production"
+seriesPart: 11
+seeAlso: ["code-rag-cross-encoder-reranking"]
+---
+
+*Part 11 of the Code RAG series. Parts 1–10 fixed chunking, added vocabulary enrichment, applied hybrid search, and added cross-encoder re-ranking. This post tries a different approach: instead of improving the index or the ranking, change what gets embedded at query time.*
+
+---
+
+## The vocabulary gap, from the query side
+
+Every fix in this series so far has been index-time or post-retrieval:
+
+- Parts 3–4: make chunks better so queries can find them
+- Part 5: add a lexical boost at query time, but don't change the query embedding
+- Part 6: re-rank after retrieval
+
+One thing we haven't tried: change the query embedding itself.
+
+The vocabulary gap for `"S3 NoSuchKey missing key error"` is a mismatch between two vocabularies:
+
+```
+Query vocabulary:   NoSuchKey, missing, key, error       ← incident language
+Index vocabulary:   copyObject, deleteObject, bucket, key ← code language
+```
+
+Hybrid search (Part 5) pushed NoSuchKey from rank 7 to rank 3 by adding a lexical bonus — the word "NoSuchKey" now appears in the enriched chunk, so it gets a token match. Cross-encoder re-ranking (Part 6) pushed it to rank 1 by reading query and document together.
+
+HyDE takes a different approach: instead of searching with the error message, generate a hypothetical JavaScript function that would produce that error, and embed that instead.
+
+---
+
+## What HyDE is
+
+HyDE (Hypothetical Document Embeddings) comes from Gao et al., 2022. The insight: query embeddings and document embeddings live in different regions of the embedding space. A question and its answer are semantically related but not geometrically close — they use different vocabulary, different structure, different intent.
+
+The fix: don't embed the query. Generate a hypothetical document that would answer the query, and embed that instead. Now you're doing document-to-document comparison, which is what the index was built for.
+
+For code search:
+
+```
+Standard search:
+  query: "S3 NoSuchKey missing key error"
+  embed query → search for similar chunks
+
+HyDE:
+  query: "S3 NoSuchKey missing key error"
+  → generate hypothetical JS function that throws NoSuchKey
+  embed hypothetical → search for similar chunks
+```
+
+The hypothetical function uses code vocabulary: `copyObject`, `deleteObject`, `try/catch`, `NoSuchKey`. The embedding is now in the same region of the space as the indexed functions.
+
+---
+
+## The implementation
+
+At query time, one Haiku call generates the hypothetical before the vector search:
+
+```python
+HYDE_PROMPT = """\
+A developer is searching a JavaScript codebase for: "{query}"
+
+Write a realistic JavaScript function (10-25 lines) that they are likely looking for.
+Use real AWS SDK / Node.js patterns. Output only the code, no explanation."""
+
+async def hyde_search(rag, client, collection, query: str, n: int = 20):
+    # Generate hypothetical function
+    msg = await client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=300,
+        messages=[{"role": "user", "content": HYDE_PROMPT.format(query=query)}],
+    )
+    hypothetical = msg.content[0].text.strip()
+
+    # Embed the hypothetical, not the original query
+    embedding = await rag._embed([hypothetical])
+    return collection.query(embedding[0], n_results=n), hypothetical
+```
+
+No changes to the index. No changes to the ranking. One extra LLM call per query, then the same vector search with a different embedding.
+
+Here is the hypothetical Haiku generated for each query:
+
+**`"moveAndRemoveFileFromS3"`:**
+```javascript
+async function moveAndRemoveFileFromS3(sourceBucket, sourceKey, destBucket, destKey) {
+  try {
+    await s3.copyObject({
+      Bucket: destBucket,
+      CopySource: `${sourceBucket}/${sourceKey}`,
+      Key: destKey
+    }).promise();
+    await s3.deleteObject({ Bucket: sourceBucket, Key: sourceKey }).promise();
+    return { success: true };
+  } catch (error) {
+    console.error('Error moving file in S3:', error);
+    throw new Error(`Failed to move file: ${error.message}`);
+  }
+}
+```
+
+**`"S3 NoSuchKey missing key error"`:**
+```javascript
+async function getS3ObjectWithErrorHandling(bucket, key) {
+  const s3Client = new S3Client({ region: "us-east-1" });
+  try {
+    const command = new GetObjectCommand({ Bucket: bucket, Key: key });
+    const response = await s3Client.send(command);
+    return response;
+  } catch (error) {
+    if (error.name === "NoSuchKey") {
+      console.error(`S3 NoSuchKey: ${key} not found in ${bucket}`);
+      throw new Error(`S3 object not found: ${key}`);
+    }
+    throw error;
+  }
+}
+```
+
+The first hypothetical closely mirrors `moveAndRemoveFileFromS3` — same `copyObject`/`deleteObject` pattern, same parameter names, same error handling shape. The second one is a `GetObjectCommand` function with explicit `NoSuchKey` handling. That is a valid answer to "what function throws NoSuchKey" — but it's not our function.
+
+---
+
+## The results
+
+Five-way comparison across all four queries:
+
+```
+Query                               Line      Fn-bndry  Enriched  Hybrid    HyDE
+---------------------------------------------------------------------------------
+moveAndRemoveFileFromS3             r3 0.560  r1 0.709  r1 0.675  r1 0.772  r1 0.836
+copy S3 object then delete source   r4 0.503  r1 0.572  r1 0.572  r1 0.700  r1 0.752
+S3 copyObject deleteObject bucket   r7 0.502  r2 0.597  r2 0.614  r1 0.730  r1 0.752
+S3 NoSuchKey missing key error      –  –      –  –      r7 0.282  r3 0.438  r5 0.596
+```
+
+For queries 1–3, HyDE improves on every metric. The function-name query goes from score 0.772 (hybrid) to 0.836. The hypothetical function closely mirrors the actual source — same API calls, same structure — and the similarity score reflects it.
+
+For the vocabulary gap query, the result is the opposite of what we hoped: rank 3 → rank 5.
+
+The score increased (0.438 → 0.596). But rank got worse. Three functions now outrank `moveAndRemoveFileFromS3` that hybrid search had ranked below it. The top 5 HyDE results for `"S3 NoSuchKey missing key error"`:
+
+```
+rank 1  score=0.685  removeFile
+rank 2  score=0.656  UploadOriginaltoS3
+rank 3  score=0.656  compressAndUploadtoS3
+rank 4  score=0.624  generateThumbnailAndUploadtoS3
+rank 5  score=0.619  getBufferFromBucket
+        ← moveAndRemoveFileFromS3 not shown
+```
+
+`moveAndRemoveFileFromS3` is at rank 5 and doesn't appear in this top-5 detail view — it was pushed down by four S3 functions that share the hypothetical's vocabulary: `GetObjectCommand`, `S3Client`, `send()`, AWS SDK v3 patterns. Those functions use the same API shape as the hypothetical even though they don't handle `NoSuchKey`.
+
+---
+
+## Why it worked for queries 1–3 and failed for query 4
+
+The pattern is clear when you look at what each hypothetical contains.
+
+For queries 1–3 — function-name and code-operation queries — Haiku generated hypotheticals that closely mirror the actual function: `copyObject`, `deleteObject`, `bucket`, `key`, `promise()`, error catch. The generated code uses v2 SDK patterns (`.promise()`) which matches the indexed code. The hypothetical is in the same region of embedding space as `moveAndRemoveFileFromS3`.
+
+For the `NoSuchKey` query, Haiku generated a `GetObjectCommand` function. This is a reasonable answer to "what function throws NoSuchKey" — you'd expect it on a `getObject` call when the key doesn't exist. But our actual production incident comes from `copyObject` failing on a missing source key, not from `getObject`. The hypothetical went toward "explicit NoSuchKey handling" rather than "the function that silently produces NoSuchKey."
+
+This is the fundamental limitation of HyDE for incident-style queries: the hypothetical reflects how the LLM thinks the error would be handled, not how it actually is handled in the specific codebase. The production function has no `if (error.code === 'NoSuchKey')` check — it catches everything and logs generically. The hypothetical has explicit error handling. They don't match.
+
+---
+
+## The non-determinism problem
+
+HyDE introduces query-time non-determinism. Each call to Haiku can generate a different hypothetical, leading to different results for the same query.
+
+Running the eval twice for `"S3 NoSuchKey missing key error"` produced two different hypotheticals:
+
+- Run 1: `getS3ObjectWithErrorHandling` using `GetObjectCommand` → target at rank 5
+- Run 2: a different S3 function with explicit `NoSuchKey` check → different ranking
+
+For a production system this is a problem. A user searching for the same incident twice gets different results. The hybrid search approach (Part 5) is fully deterministic — the same query always returns the same ranking.
+
+Mitigations exist: cache the hypothetical keyed on the query string, use temperature=0, or generate multiple hypotheticals and average the embeddings. But each mitigation adds latency or complexity that the deterministic approaches don't require.
+
+---
+
+## When HyDE is the right tool
+
+The results point to a clear pattern:
+
+**HyDE works well when:**
+- The query uses the same vocabulary and patterns as the indexed code
+- The LLM can generate a hypothetical that closely mirrors the actual function
+- Exact recall matters more than determinism
+
+**HyDE works poorly when:**
+- The query is in incident vocabulary and the code doesn't explicitly handle the error
+- The LLM's "reasonable" hypothetical differs from the actual implementation
+- You need consistent results across repeated queries
+
+For this codebase, the code-vocabulary queries (1–3) were already at rank 1 after hybrid search. HyDE improved their scores but didn't change their ranks — no practical benefit for a top-k retrieval system. The one query that needed improvement (NoSuchKey) got worse.
+
+The better tools for this codebase, in order of impact:
+
+1. Function-boundary chunks (Part 3) — large rank improvements, free at query time
+2. Hybrid search (Part 5) — pushed NoSuchKey from rank 7 to rank 3
+3. Cross-encoder re-ranking (Part 6) — pushed NoSuchKey from rank 3 to rank 1
+4. HyDE — improves scores on code queries already at rank 1; hurts the incident query
+
+HyDE would be the right first tool if none of Parts 3–6 existed: embedding a hypothetical is cheaper than re-indexing and doesn't require a corpus of labeled examples. For a new codebase where you haven't done the chunking and enrichment work, HyDE gives you a quick improvement with one LLM call per query. For a mature index with hybrid search and re-ranking already in place, the gains are marginal on the queries that are already working and negative on the queries that matter most.
+
+---
+
+## The full progression
+
+```
+Part 2  (line-based):
+  moveAndRemoveFileFromS3             → r3,  0.560
+  copy S3 object delete source        → r4,  0.503
+  S3 copyObject deleteObject          → r7,  0.502
+  S3 NoSuchKey missing key error      → not found
+
+Part 3  (function-boundary chunks):
+  moveAndRemoveFileFromS3             → r1,  0.709  (r3→r1)
+  copy S3 object delete source        → r1,  0.572  (r4→r1)
+  S3 copyObject deleteObject          → r2,  0.597  (r7→r2)
+  S3 NoSuchKey missing key error      → not found   (unchanged)
+
+Part 4  (LLM descriptions):
+  moveAndRemoveFileFromS3             → r1,  0.675
+  copy S3 object delete source        → r1,  0.572
+  S3 copyObject deleteObject          → r2,  0.614
+  S3 NoSuchKey missing key error      → r7,  0.282  (first appearance)
+
+Part 5  (hybrid search):
+  moveAndRemoveFileFromS3             → r1,  0.772
+  copy S3 object delete source        → r1,  0.700
+  S3 copyObject deleteObject          → r1,  0.730
+  S3 NoSuchKey missing key error      → r3,  0.438  (r7→r3)
+
+Part 6  (cross-encoder re-ranking):
+  moveAndRemoveFileFromS3             → r1,  —
+  copy S3 object delete source        → r1,  —
+  S3 copyObject deleteObject          → r1,  —
+  S3 NoSuchKey missing key error      → r1,  —      (r3→r1)
+
+Part 11 (HyDE):
+  moveAndRemoveFileFromS3             → r1,  0.836  (+0.064 over hybrid)
+  copy S3 object delete source        → r1,  0.752  (+0.052 over hybrid)
+  S3 copyObject deleteObject          → r1,  0.752  (+0.022 over hybrid)
+  S3 NoSuchKey missing key error      → r5,  0.596  (r3→r5, regression)
+```
+
+Parts 3–6 are the load-bearing improvements. HyDE is additive on queries that are already working and subtractive on the query that drove the whole series. The honest result: index-time and post-retrieval techniques outperformed query-time embedding replacement for this specific codebase and these specific queries.
+
+---
+
+*The series covers the full production pipeline: chunking strategy, vocabulary enrichment, hybrid retrieval, re-ranking, index maintenance, and observability. This post closes the retrieval quality arc.*
