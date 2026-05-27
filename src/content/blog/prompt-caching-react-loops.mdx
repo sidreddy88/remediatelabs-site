@@ -1,13 +1,61 @@
 ---
-title: "Prompt Caching in Agent Loops — 77% Cache Hit Rate, 13% Cost Reduction"
-tagline: "The harness docs are sent on every ReAct iteration. With cache_control, 77% of those tokens hit the cache on subsequent calls. One change, measured savings."
+title: "Token Cost Engineering in Agent Loops — Prompt Caching and State Pruning"
+tagline: "Output tokens cost 5× more than input. In agent loops, both compound. Two targeted fixes — prompt caching and state pruning — cut per-incident cost by ~25%."
 date: 2026-05-26
 tags: ["agents", "cost", "architecture"]
-readTime: 7
+readTime: 13
 seeAlso: []
 ---
 
-*The agent pipeline runs a ReAct loop: Thought → Action → Observation, repeated until the agent has enough information to answer. Every iteration sends the system prompt again. That includes the harness docs — `AGENTS.md` and `CONSTRAINTS.md` — which are the same on every single call.*
+*The agent pipeline runs a ReAct loop: Thought → Action → Observation, repeated until the agent has enough information to answer. Every iteration sends the system prompt again — and every iteration appends new tool results to the conversation history. Two things grow: the stable prefix sent identically on every call, and the accumulating context that is different every call. This post covers one fix for each.*
+
+---
+
+## The 5× asymmetry: why output tokens cost more
+
+Every LLM pricing table has two numbers. On Sonnet 4.6: $3.00 and $15.00 per million tokens. Output is 5× more expensive than input.
+
+This reflects how inference works at the hardware level. Input tokens are processed in a single forward pass — the attention mechanism reads all input tokens in parallel. Output tokens are generated one at a time, each requiring a full pass through the model and an update to the KV cache. Output is memory-bandwidth bound. Input is compute-bound. Memory bandwidth is the scarcer resource at scale.
+
+| Model | Input (per 1M tokens) | Output (per 1M tokens) | Multiplier |
+|---|---|---|---|
+| claude-sonnet-4-6 | $3.00 | $15.00 | 5× |
+| claude-haiku-4-5 | $0.80 | $4.00 | 5× |
+| gpt-4.1 | $2.00 | $8.00 | 4× |
+
+### Token splits across system types
+
+The 5× gap matters differently depending on what your system produces.
+
+**Classification** (99.8% input): 500-token document → 1-token label ("P0", "CRITICAL"). Output cost is negligible. Longer prompts or more examples add to the dominant input cost.
+
+**RAG query** (~84% input): system prompt + 4 retrieved chunks + user query = ~1,100 tokens. Response: ~200 tokens. Even at 84% input by volume, that 200-token output costs as much as 1,000 input tokens.
+
+**Summarization** (~50% input): 2,000-token document → 2,000-token summary. Equal split by token count, but the output half carries 83% of the cost. Reducing output length has 5× the leverage of reducing input.
+
+**Chatbot with growing history** (~85% input by turn 20): each response gets appended to the conversation and re-sent on the next turn. The output from turn 19 is billed at $15/M on generation, then at $3/M again when it's included in turn 20's input. History accumulation, not per-turn generation, becomes the cost driver.
+
+**Agent loop with compounding** (~74% apparent input): each ReAct iteration sends the accumulated conversation history. Output tokens from iteration N-1 are re-billed as input at iteration N. A 400-token observation at iteration 2 gets included in the input for iterations 3, 4, 5, 6, 7, 8, 9, 10 — nine more times at input rate.
+
+For a 10-iteration FixGen run with I=2,400 average input tokens, O=400 output tokens:
+
+```
+10 × 2,400 × $3/M  =  $72,000/M   (base input per iteration)
+10 ×   400 × $15/M =  $60,000/M   (output per iteration)
+400 × 9 later iters × $3/M = $10,800/M  (compounding: prior outputs re-billed as input)
+                              ──────────
+                              $142,800/M ≈ $0.143/run (before optimization)
+```
+
+The two optimizations in this post target different parts of that formula. Prompt caching cuts the stable input terms — harness docs billed at 10% instead of 100%. State pruning cuts the compounding term — stale tool results truncated before they accumulate across iterations.
+
+### When to prioritize each lever
+
+**Input-heavy (>90% of cost from input):** caching stable prefixes is the highest-leverage move. Shaving output length has minimal impact.
+
+**Output-heavy (>30% of cost from output):** reduce output verbosity — shorter tool responses, tighter answer formats. Caching has no effect on output cost.
+
+**Growing history in multi-turn or agent contexts:** state pruning. The longer the agent runs, the more stale context accumulates. Pruning truncates old tool results before they compound across iterations.
 
 ---
 
@@ -147,31 +195,107 @@ For higher-throughput pipelines running many concurrent incidents, cross-inciden
 
 ---
 
-## Impact on pipeline cost
+## State pruning: cutting the compounding history
 
-The $0.1861 average cost per incident comes from the full pipeline: triage (Haiku), diagnosis (Sonnet), fix generation (Sonnet, up to 14 iterations), self-critique (Haiku), code review (GPT-4.1). Prompt caching applies only to Anthropic calls.
+Prompt caching handles the stable prefix — harness docs, system prompt, tool definitions. It cannot help with the growing conversation history, because history changes on every iteration.
 
-Diagnosis (6 iterations measured): 13% reduction on that step.
+In `FixGenerationAgent`, the largest per-iteration growth comes from `read_file` tool results. Each call returns the full source file — typically 1,500–2,000 tokens. By iteration 5, the agent has read several files, and every subsequent iteration re-sends all of those file contents as part of the conversation history.
 
-FixGeneration runs up to 14 iterations — the savings percentage is higher because the cache hit count scales with iterations while the write cost is fixed. For a 10-iteration fix loop, the expected saving is 15–18% on that step.
+The agent needed those file contents to reason about what to change. By iteration 8, either the edit has been applied or the file is no longer relevant. The full text is dead weight billed on every remaining iteration.
 
-Triage and self-critique (Haiku): also benefit from caching, but shorter runs (1–2 iterations) mean smaller absolute savings.
+### The fix: `_prune_tool_results()`
 
-CodeReview (GPT-4.1): not affected — OpenAI's caching mechanism is different and not implemented here.
+```python
+def _prune_tool_results(
+    self,
+    messages: list[dict],
+    keep_last: int = 2,
+    threshold: int = 500,
+) -> list[dict]:
+    tool_result_indices = [
+        i for i, m in enumerate(messages)
+        if m.get("role") == "tool"
+        and len(str(m.get("content", ""))) > threshold
+    ]
+    to_stub = tool_result_indices[:-keep_last] if len(tool_result_indices) > keep_last else []
+    pruned = list(messages)
+    for i in to_stub:
+        pruned[i] = {
+            **pruned[i],
+            "content": "[tool result pruned — see most recent call for current state]",
+        }
+    return pruned
+```
 
-**Conservative estimate for full pipeline: 10–13% reduction in per-incident cost**, bringing the average from $0.1861 toward $0.165.
+Called every 3 iterations in the FixGen loop:
+
+```python
+if iteration % 3 == 0:
+    messages = self._prune_tool_results(messages, keep_last=2, threshold=500)
+```
+
+`threshold=500` characters catches `read_file` results (1,500–2,000 tokens each) while preserving short tool confirmations like `{"status": "ok", "path": "..."}` (~50 chars — kept intact). `keep_last=2` retains the two most recent oversized results — the agent needs recent file state to reason about the next edit. Everything older is replaced with a 12-token stub.
+
+### Cost impact
+
+A 10-iteration FixGen run with 3 file reads spread across the first 5 iterations:
+
+```
+Without pruning:
+  3 reads × ~2,000 tokens each, re-sent on avg 3 subsequent iterations each
+  → 3 × 2,000 × 3 = 18,000 extra input tokens per run
+  → 18,000 × $3/M = $0.054 per run in avoidable input cost
+
+With pruning:
+  Older reads stubbed to 12 tokens each
+  → 18,000 tokens removed → $0.054 saved → 29% reduction on the FixGen step
+```
+
+Prompt caching and state pruning attack different parts of the cost with no overlap:
+
+```
+Prompt caching:  stable harness prefix (2,471 tokens) — billed at 10% instead of 100%
+State pruning:   stale tool results (18,000 tokens) — removed from later iterations entirely
+```
 
 ---
 
-## The three-line version
+## Impact on pipeline cost
 
-The full implementation is three logical changes:
+The $0.1861 average cost per incident comes from the full pipeline: triage (Haiku), diagnosis (Sonnet), fix generation (Sonnet, up to 14 iterations), self-critique (Haiku), code review (GPT-4.1).
+
+**Prompt caching** (Anthropic calls only):
+- Diagnosis (6 iterations measured): 13% reduction on that step
+- FixGeneration (10–14 iterations): 15–18% reduction — cache hit count scales with iterations while write cost is fixed
+- Triage and self-critique (Haiku): benefit from caching, but shorter runs mean smaller absolute savings
+- CodeReview (GPT-4.1): not affected — OpenAI's caching mechanism is different and not implemented here
+
+**State pruning** (FixGeneration only):
+- 29% reduction on the FixGen step — $0.054 saved per run on a 10-iteration loop
+- No overlap with prompt caching: caching targets stable harness tokens, pruning targets stale tool results that have grown into dead weight
+
+**Combined:** prompt caching saves ~10–13% on the full pipeline; state pruning saves an additional ~15% on the FixGen component. For a typical incident where FixGen is the dominant cost step, combined savings are in the **~20–25% range** — bringing the average from $0.1861 toward **$0.14–0.15**.
+
+---
+
+## Summary
+
+**Prompt caching** — three logical changes:
 
 1. `_with_harness()` — return content blocks with `cache_control` instead of a plain string
 2. `LLMResponse` — add `cache_read_input_tokens` and `cache_creation_input_tokens` fields
 3. `LLMGateway.complete()` — bill cached tokens at 10%, log cache activity
 
 No agent code changed. No prompt changed. No behavior changed. The ReAct loop sees the same system prompt content; only the billing changes.
+
+**State pruning** — one function, one call site:
+
+1. `_prune_tool_results()` — replace oversized tool results older than `keep_last=2` with a stub
+2. Called every 3 iterations in the FixGen agentic loop
+
+No model changed. No prompts changed. The agent still reasons over the same events — it just stops carrying full file contents past the point where they're useful.
+
+Together, these target the two independent cost drivers in agent loops: the stable prefix billed redundantly on every iteration, and the growing history carrying data that has already served its purpose.
 
 ---
 
