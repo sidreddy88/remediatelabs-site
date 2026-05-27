@@ -48,9 +48,11 @@ const stack = [
   { layer: "Agent runtime", value: "Anthropic SDK · Claude Opus 4.6 / Sonnet 4.6 / Haiku 4.5" },
   { layer: "Web framework", value: "FastAPI · WebSocket streaming · Pydantic v2" },
   { layer: "Storage", value: "Postgres (SQLAlchemy Core) · pgvector for RAG" },
+  { layer: "RAG", value: "Function-boundary chunking · hybrid search (α=0.7 vector + 0.3 lexical, min_score=0.45) · cross-encoder rerank · document chunk registry" },
   { layer: "Sandbox", value: "Docker Compose · Jest · mongodb-memory-server" },
   { layer: "Tracing", value: "Langfuse — every LLM call + tool execution as nested spans" },
   { layer: "Resilience", value: "Circuit breakers · schema validation at handoffs · context checkpointing" },
+  { layer: "Cost", value: "Prompt caching (cache_control: ephemeral · 77% hit rate · 13% reduction on diagnosis) · state pruning (~18K tokens removed per FixGen run) · model routing Haiku / Sonnet / GPT-4.1" },
   { layer: "Deploy", value: "AWS ECS Fargate · ALB · Cloudflare · GitHub Actions OIDC" },
   { layer: "Frontend", value: "React + Vite · WebSocket dashboard · served from same container" },
 ];
@@ -58,8 +60,8 @@ const stack = [
 const agents = [
   { name: "IncidentResponseAgent", role: "Orchestrates the full pipeline. Receives error events, runs dedup checks, coordinates Triage → Diagnosis → Fix in sequence, and manages the approval gate.", pattern: "Orchestrator + tool chain" },
   { name: "TriageAgent", role: "Classifies events as real / noise / duplicate. P0–P3 severity. Haiku for cost.", pattern: "ReAct + typed wrapper" },
-  { name: "DiagnosisAgent", role: "Roots every claim against the live repo via GitHub Code Search.", pattern: "ReAct + grounding guards" },
-  { name: "FixGenerationAgent", role: "Writes the patch (Sonnet). Haiku self-critique rejects bad fixes before they hit the sandbox. Retries 3× on test failure.", pattern: "Direct LLM + critique + sandbox" },
+  { name: "DiagnosisAgent", role: "Roots every claim against the live repo via GitHub Code Search. Retrieves relevant code context via hybrid search (α=0.7 vector + 0.3 lexical, min_score=0.45 quality floor).", pattern: "ReAct + grounding guards" },
+  { name: "FixGenerationAgent", role: "Writes the patch (Sonnet). Haiku self-critique rejects bad fixes before they hit the sandbox. Retries 3× on test failure. State pruning removes stale read_file results every 3 iterations (~18K tokens per run).", pattern: "Direct LLM + critique + sandbox" },
   { name: "CodeReviewAgent", role: "Posts a GPT-4.1 review to the opened PR. Cross-provider by design — the reviewer is enforced to be a different model family than the generator.", pattern: "Direct LLM · cross-provider" },
 ];
 ---
@@ -177,9 +179,12 @@ const agents = [
       </li>
       <li>
         <strong class="text-ink">RAG finds candidates. The live store confirms truth.</strong>
-        pgvector holds index-time snapshots; current incident state lives in
-        Postgres. Blocking decisions always re-read the live store —
+        pgvector holds index-time snapshots; current incident state lives in Postgres. Blocking
+        decisions always re-read the live store —
         <a href="/blog/rag-index-vs-live-store">the post explains why</a>.
+        Code retrieval uses hybrid search (70% vector + 30% lexical, min_score=0.45) with
+        cross-encoder reranking — upgraded from pure vector after both agents were found to be
+        passing low-relevance chunks to the LLM regardless of score.
       </li>
       <li>
         <strong class="text-ink">Hard blocks are deterministic, soft hints are LLM-shaped.</strong>
@@ -207,6 +212,16 @@ const agents = [
       <li>
         <strong class="text-ink">Approval gate before every merge.</strong> All PRs require
         human approval; HIGH/CRITICAL incidents escalate immediately. Rejections are logged as RLHF preference pairs.
+      </li>
+      <li>
+        <strong class="text-ink">Two orthogonal controls on token cost.</strong>
+        Prompt caching marks the stable harness prefix with
+        <code class="text-accent">cache_control: ephemeral</code> — 77% cache hit rate,
+        13% cost reduction on the diagnosis step. State pruning removes stale
+        <code class="text-accent">read_file</code> results from the FixGen conversation history
+        every 3 iterations (~18K tokens per 10-iteration run, 29% reduction on that step).
+        Neither interferes with the other: caching targets what is always the same, pruning
+        targets what has already served its purpose.
       </li>
     </ol>
   </section>
