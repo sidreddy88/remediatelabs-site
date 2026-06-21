@@ -1,0 +1,183 @@
+---
+title: "We Built a Call Graph Because Our Agent Kept Breaking Callers It Never Knew About"
+tagline: "The agent found one caller via GitHub search, patched it, and shipped. Two other callers broke in production. The fix was correct. The picture was incomplete."
+date: 2026-06-21
+tags: ["code-graph", "agents", "architecture"]
+readTime: 9
+series: "Code Graph in Production"
+seriesPart: 1
+---
+
+Our autonomous incident response agent was fixing bugs. The fixes were technically correct. The PRs were passing review. And then, a few routes later, something else would break — in a completely different file, calling the function we had just patched.
+
+The agent had no idea those callers existed.
+
+---
+
+## The Failure Mode
+
+When a production incident fires, our pipeline runs a full ReAct loop: triage → diagnosis → fix generation → code review → PR. The fix generation agent identifies the broken function, patches it, and opens a PR.
+
+Here is a real example from our prod codebase. `classifyFields` — a function that categorizes interview question fields before saving — started returning `null` instead of a typed result. The agent diagnosed it correctly: a missing null check on the OpenAI response. The fix was right.
+
+What the agent didn't know: `classifyFields` is called from three different route files.
+
+```
+routes/services/image.js  → classifyFields()
+routes/services/video.js  → classifyFields()
+routes/posts.js           → classifyFields()
+```
+
+The agent searched GitHub for `classifyFields`. GitHub Code Search returned `routes/services/image.js` as the top result — the file with the most recent activity. The agent read it, confirmed the caller was compatible with the new return type, and shipped the PR.
+
+`routes/services/video.js` and `routes/posts.js` were never touched. No CI failure — those routes don't have unit tests for this path. The review passed. Two routes silently broke in production because the agent treated "first search result" as "complete picture."
+
+This is not an edge case. It is the default failure mode of any agent that uses string search to understand blast radius.
+
+---
+
+## Why GitHub Code Search Wasn't Enough
+
+We already had GitHub Code Search wired into the fix generation agent. When it needed to understand where a function was used, it called:
+
+```
+GET /search/code?q=classifyFields+repo:org/repo
+```
+
+This finds files that *contain the string* `classifyFields`. Useful for locating where a function is defined. But it has three fundamental problems for caller analysis:
+
+**1. It's a string search, not a structural search.**
+`classifyFields` in a comment, in a string literal, in a variable name, in a disabled test — all return as matches. The agent has to read each result and decide whether it is an actual call site. That burns tool calls and context.
+
+**2. It returns files, not call sites.**
+The response is a list of file paths. The agent still has to read each file, find the actual call expression, understand the calling context, and decide what to update.
+
+**3. Ordering is by relevance, not completeness.**
+GitHub ranks by match density and recency. The most recently active file ranked first. The other two callers ranked lower and the agent never got to them.
+
+The result: agents were systematically underestimating blast radius. Find one caller, patch it, ship the PR, move on. The others break later.
+
+---
+
+## The Fix: A Call Graph With a Reverse Index
+
+A call graph is a directed graph where nodes are functions and edges are calls between them. We built two indices over this graph:
+
+```python
+forward["classifyFields"]  = {"openai.complete", "validateSchema"}  # what it calls
+reverse["classifyFields"]  = [                                       # what calls it
+    CallerInfo(file="routes/services/image.js", function="processImage", line=84),
+    CallerInfo(file="routes/services/video.js", function="processVideo", line=61),
+    CallerInfo(file="routes/posts.js",          function="createPost",   line=112),
+]
+```
+
+The reverse index is what the agent actually needed. Before patching any function, it now calls:
+
+```python
+callers = code_graph.find_callers("classifyFields")
+# → all three callers, instantly, from memory
+```
+
+This is an O(1) dict lookup. No API call. No rate limit. No ranking algorithm hiding the third result. The complete picture, immediately.
+
+---
+
+## How We Built It: Three Layers
+
+### Layer 1 — Tree-sitter extracts the edge list
+
+We use tree-sitter to parse every JS/TS file in the prod codebase. Tree-sitter produces a Concrete Syntax Tree — every token, every node, including call expressions. We walk the tree to extract two things per file:
+
+**Function definitions** — where each function lives:
+```python
+FunctionDef(name="processImage", start_byte=2100, end_byte=2890, kind="arrow")
+```
+
+**Call sites** — who calls whom:
+```python
+CallSite(caller_name="processImage", callee_name="classifyFields", line=84)
+```
+
+The key technique for attributing call sites to their containing function is **byte-range containment**: we binary-search the sorted list of function definitions by `start_byte` to find which function contains each call expression. O(log n) per call site, no extra tree traversal needed.
+
+We handle all three JS/TS function forms that a regex-based approach misses:
+- `function processImage() {}` — function declarations
+- `const processImage = async () => {}` — arrow functions
+- `class ImageService { processImage() {} }` — class methods
+
+### Layer 2 — Postgres for durability
+
+The raw edge list (caller_file, caller_function, callee_name, line) gets bulk-inserted into a `code_graph_edges` table with two indexes:
+
+```sql
+Index("idx_cge_callee",      "callee_name")   -- reverse lookup: what calls X?
+Index("idx_cge_caller_file", "caller_file")   -- invalidation: re-index changed file
+```
+
+The callee index is what makes reverse lookup fast on disk. The caller_file index enables incremental updates — when a file changes (PR merged, webhook fires), we delete its stale edges and re-parse only that file.
+
+### Layer 3 — Hash map of sets in memory
+
+On server startup, we load all Postgres rows into an in-memory `CodeGraph`:
+
+```python
+reverse["classifyFields"] = [CallerInfo(...), CallerInfo(...), CallerInfo(...)]
+forward["processImage"]   = {"classifyFields", "uploadToS3", "logActivity"}
+```
+
+Every agent query hits this in-memory structure. No disk I/O at query time. O(1) lookup.
+
+---
+
+## GitHub Search vs Call Graph
+
+| | GitHub Code Search | Call Graph |
+|---|---|---|
+| Query type | String match | Structural (AST) |
+| Precision | Low — matches comments, strings, variable names | High — only actual call expressions |
+| Recall | First page of results, ranked by relevance | Complete — every caller, every file |
+| Latency | 200–800ms per query, rate-limited | O(1) in-memory dict lookup |
+| Rate limit | 10 requests/minute | None |
+| Answers "what calls X?" | Approximately | Exactly |
+
+The GitHub search was never wrong, exactly — `classifyFields` *was* in those files. But returning the top result and stopping is the same as being wrong when you are making autonomous code changes. The agent made decisions based on an incomplete picture and shipped PRs that broke things downstream.
+
+---
+
+## The Numbers
+
+After indexing the full prod codebase (427 JS files):
+
+```
+Edges persisted:    33,597
+Unique callers:      1,022
+Unique callees:      1,263
+```
+
+33,597 caller → callee relationships available in O(1). Before, the agent was sampling this graph with a string search and hoping the first page was representative. Now it reads the complete picture in a single dict lookup.
+
+---
+
+## What the Agent Does Now
+
+Before generating a fix, the agent's tool call sequence now looks like:
+
+```
+1. search_codebase("classifyFields null return")  → find the broken function
+2. read_file("routes/services/image.js")          → understand the function
+3. find_callers("classifyFields")                 → discover all 3 callers
+4. read_file("routes/services/video.js")          → read caller #2
+5. read_file("routes/posts.js")                   → read caller #3
+6. apply_edit(...)                                → patch classifyFields
+7. patch_line(...)                                → update video.js call site
+8. patch_line(...)                                → update posts.js call site
+```
+
+Step 3 used to be a GitHub search that returned 1 result. Now it is a dict lookup that returns 3. The agent reads all of them, decides which ones need updating given the nature of the fix, and includes those updates in the same PR.
+
+The fix is no longer just correct — it is complete.
+
+---
+
+*Part 2 covers the data structure decision: five ways to represent a call graph, what each costs at query time and build time, and why we ended up with a hash map of sets backed by Postgres.*
