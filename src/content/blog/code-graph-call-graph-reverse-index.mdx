@@ -99,7 +99,23 @@ FunctionDef(name="processImage", start_byte=2100, end_byte=2890, kind="arrow")
 CallSite(caller_name="processImage", callee_name="classifyFields", line=84)
 ```
 
-The key technique for attributing call sites to their containing function is **byte-range containment**: we binary-search the sorted list of function definitions by `start_byte` to find which function contains each call expression. O(log n) per call site, no extra tree traversal needed.
+**Attributing call sites to their containing function** is the non-obvious part. After parsing, you have a flat list of call expressions and a flat list of function definitions. You need to know which function each call lives inside — that's what produces the edge `processImage → classifyFields` instead of just knowing `classifyFields` was called somewhere in the file.
+
+The naive approach: a second tree traversal with a stack — push when you enter a function node, pop when you leave, tag each call with whatever's on top. Works, but it's an extra O(n) pass and requires tracking traversal state.
+
+We use **byte-range containment** instead. Every AST node has a `start_byte` and `end_byte` — its exact position in the raw file bytes. A call expression at byte 2,400 is inside a function if that function spans bytes 2,100–2,890. Source files are linear, so containment reduces to a range check.
+
+1. Sort all function definitions by `start_byte` (one-time cost)
+2. For each call expression, binary-search for the last function whose `start_byte ≤ call.start_byte`
+3. Verify `call.start_byte ≤ that_function.end_byte` — if yes, the call is inside it
+
+```python
+idx = bisect.bisect_right(start_bytes, call_node.start_byte) - 1
+if idx >= 0 and call_node.start_byte <= fn_defs_sorted[idx].end_byte:
+    # call belongs to fn_defs_sorted[idx]
+```
+
+O(log n) per call site. No stack, no second traversal, no tree-walking state. The insight is that "which function contains this call?" is just "which sorted interval does this byte offset fall in?" — and that's a binary search.
 
 We handle all three JS/TS function forms that a regex-based approach misses:
 - `function processImage() {}` — function declarations
