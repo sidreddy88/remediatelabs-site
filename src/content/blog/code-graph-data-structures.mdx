@@ -1,0 +1,247 @@
+---
+title: "Five Data Structures for a Call Graph — Why We Chose Hash Map of Sets"
+tagline: "The adjacency matrix sounds clever. It's wrong for sparse graphs. The edge list is right for serialization and wrong for queries. Here's what each actually costs."
+date: 2026-06-21
+tags: ["code-graph", "agents", "architecture"]
+readTime: 10
+series: "Code Graph in Production"
+seriesPart: 2
+seeAlso: ["code-graph-call-graph-reverse-index"]
+---
+
+*Part 2 of the Code Graph series. Part 1 covered why our AI fix agent was missing callers and how a reverse-indexed call graph fixes it. This post is about the data structure choice underneath that: what you actually use to represent a call graph, and why it matters.*
+
+---
+
+In Part 1, we built a call graph to give our fix agent structural certainty about blast radius before it touches any code. The agent calls `find_callers("classifyFields")` and gets every caller back instantly.
+
+This post is about the decision underneath that: what data structure do you actually use to represent a call graph, and why does it matter?
+
+There are five real options. Each makes a different trade-off between build time, query time, and space. The wrong choice doesn't just hurt performance — it changes what questions you can answer at all.
+
+---
+
+## The Variables
+
+Before comparing structures, define the variables:
+
+- **V** — number of functions (vertices). Our prod codebase: ~1,022 unique callers.
+- **E** — number of call edges. Our prod codebase: 33,597.
+- **d** — degree of a node. Average callers/callees for a specific function. Varies widely: `classifyFields` has 3, `getServerUrl` has hundreds.
+
+A codebase call graph is **sparse**: E is much smaller than V². Most functions don't call most other functions. This single fact eliminates some structures immediately.
+
+---
+
+## Structure 1 — Edge List
+
+The simplest possible representation: a flat list of `(caller, callee)` tuples.
+
+```python
+edges = [
+    ("processImage",  "classifyFields"),
+    ("processVideo",  "classifyFields"),
+    ("createPost",    "classifyFields"),
+    ("processImage",  "uploadToS3"),
+    ...
+]
+```
+
+**Time complexity**
+
+| Operation | Time |
+|---|---|
+| Build | O(E) — just append |
+| Find all callers of X | O(E) — full scan |
+| Check if A calls B | O(E) — full scan |
+
+**Space complexity:** O(E)
+
+**The problem:** Every query is O(E). With 33,597 edges, finding callers of `classifyFields` means scanning all 33,597 rows. That's fine for a one-time script. It's not fine for an agent calling `find_callers` inside a ReAct loop on every incident.
+
+**When it's the right choice:** Serialization. The edge list is what tree-sitter naturally produces — one tuple per call expression as you walk the tree. We use it as the intermediate format between the parser and the in-memory graph. Build it, persist it to Postgres, then throw it away. Never use it for queries.
+
+---
+
+## Structure 2 — Adjacency Matrix
+
+An N×N boolean grid where `matrix[i][j] = True` if function i calls function j. Rows are callers, columns are callees.
+
+```python
+# Functions: [classifyFields=0, processImage=1, processVideo=2, createPost=3, ...]
+matrix = [
+    #  cF     pI     pV     cP
+    [False, False, False, False],  # classifyFields calls nothing relevant
+    [True,  False, False, False],  # processImage calls classifyFields
+    [True,  False, False, False],  # processVideo calls classifyFields
+    [True,  False, False, False],  # createPost calls classifyFields
+]
+```
+
+**Time complexity**
+
+| Operation | Time |
+|---|---|
+| Build | O(V²) |
+| Check if A calls B | O(1) — direct index |
+| Find all callers of X | O(V) — scan column X |
+| Find all callees of A | O(V) — scan row A |
+
+**Space complexity:** O(V²)
+
+**The problem:** For our prod codebase with ~1,000 unique functions, the matrix is 1,000 × 1,000 = 1,000,000 entries. With 33,597 actual edges, 96.6% of the matrix is `False`. You're storing 966,403 pieces of information that say "no call here."
+
+Scale to a larger codebase with 10,000 functions: 100,000,000 entries. At 1 byte each, that's 100MB of memory to store what is fundamentally a sparse graph.
+
+**When it's the right choice:** Dense graphs — when almost every pair of functions has a call relationship. Code graphs are never dense. The adjacency matrix is the wrong structure for this problem.
+
+---
+
+## Structure 3 — Adjacency List
+
+A dict mapping each node to a list of its neighbors. For a call graph, two dicts: forward (callees) and reverse (callers).
+
+```python
+forward = {
+    "processImage": ["classifyFields", "uploadToS3", "logActivity"],
+    "processVideo": ["classifyFields", "transcodeVideo"],
+    "createPost":   ["classifyFields", "saveToMongo"],
+}
+
+reverse = {
+    "classifyFields": ["processImage", "processVideo", "createPost"],
+    "uploadToS3":     ["processImage"],
+}
+```
+
+**Time complexity**
+
+| Operation | Time |
+|---|---|
+| Build | O(V + E) |
+| Find all callers of X | O(1) dict hit + O(d) to return list |
+| Find all callees of A | O(1) dict hit + O(d) to return list |
+| Check if A calls B | O(d) — scan A's callee list |
+
+**Space complexity:** O(V + E) — stores exactly the edges that exist.
+
+**The improvement over the matrix:** For our prod codebase, adjacency list uses O(33,597) space. Matrix would use O(1,000,000). Both answer "find all callers of X" — but adjacency list does it without touching any of the non-existent edges.
+
+**The weakness:** "Does A call B?" is O(d) — you scan A's callee list looking for B. For a function that calls 50 things, that's 50 comparisons. Usually fast enough, but not O(1).
+
+---
+
+## Structure 4 — Hash Map of Sets
+
+Same shape as adjacency list, but the inner container is a `set` instead of a `list`.
+
+```python
+forward = {
+    "processImage": {"classifyFields", "uploadToS3", "logActivity"},
+    "processVideo": {"classifyFields", "transcodeVideo"},
+}
+
+reverse = {
+    "classifyFields": [
+        CallerInfo(file="routes/services/image.js", function="processImage", line=84),
+        CallerInfo(file="routes/services/video.js", function="processVideo", line=61),
+        CallerInfo(file="routes/posts.js",          function="createPost",   line=112),
+    ]
+}
+```
+
+Note the asymmetry: **forward uses sets, reverse uses lists**.
+
+Forward uses sets because the question "does processImage call classifyFields?" is answered in O(1) with set membership. Order doesn't matter for callees.
+
+Reverse uses lists because we need the metadata (file path, line number) to be useful to the agent — a set of strings loses that. And we want results in a predictable order for the fix prompt.
+
+**Time complexity**
+
+| Operation | Time |
+|---|---|
+| Build | O(V + E) |
+| Find all callers of X | O(1) dict hit + O(d) to return list |
+| Check if A calls B | O(1) — set membership in forward index |
+| Add a new edge | O(1) amortized |
+| Remove an edge | O(1) |
+
+**Space complexity:** O(V + E) — same as adjacency list, slight per-set overhead.
+
+**This is what we use.** It strictly dominates the adjacency list: same space, same build time, O(1) edge existence checks instead of O(d). The only cost is that sets are unordered — we sort at query time when deterministic output matters.
+
+---
+
+## Structure 5 — Database Table with B-tree Index
+
+A relational table persisting call edges, with a B-tree index on the `callee_name` column enabling fast reverse lookup.
+
+```sql
+CREATE TABLE code_graph_edges (
+    caller_file     TEXT NOT NULL,
+    caller_function TEXT NOT NULL,
+    callee_name     TEXT NOT NULL,
+    line            INTEGER NOT NULL,
+    indexed_at      TEXT NOT NULL
+);
+
+CREATE INDEX idx_cge_callee      ON code_graph_edges(callee_name);
+CREATE INDEX idx_cge_caller_file ON code_graph_edges(caller_file);
+```
+
+**Time complexity**
+
+| Operation | Time |
+|---|---|
+| Build (bulk insert) | O(E log E) — insert + index maintenance |
+| Find all callers of X | O(log V + d) — B-tree scan + result fetch |
+| Check if A calls B | O(log E) — index lookup |
+| Incremental update (one file changed) | O(d log E) — delete old edges, insert new |
+| Transitive callers (recursive CTE) | O(V + E) |
+
+**Space complexity:** O(V + E) on disk + O(V log V) for the B-tree index pages.
+
+```sql
+-- Transitive callers in one query
+WITH RECURSIVE callers AS (
+    SELECT caller_function FROM code_graph_edges WHERE callee_name = 'classifyFields'
+    UNION
+    SELECT e.caller_function FROM code_graph_edges e
+    JOIN callers c ON e.callee_name = c.caller_function
+)
+SELECT DISTINCT caller_function FROM callers;
+```
+
+**The weakness:** Disk I/O. Even with the B-tree index, a query is O(log V + d) disk reads. For an agent making multiple `find_callers` calls per ReAct loop, that latency adds up.
+
+**When it's the right choice:** Persistence and durability. We use Postgres as the source of truth — all 33,597 edges live there and survive server restarts. But agents never query Postgres directly. On startup, we load all rows into the in-memory hash map of sets. Postgres is the write path; memory is the read path.
+
+---
+
+## Summary
+
+| Structure | Build | Caller Lookup | Edge Check | Space | Role in our system |
+|---|---|---|---|---|---|
+| Edge list | O(E) | O(E) | O(E) | O(E) | Parser output, serialization only |
+| Adjacency matrix | O(V²) | O(V) | O(1) | O(V²) | Not used — too wasteful for sparse graphs |
+| Adjacency list | O(V+E) | O(d) | O(d) | O(V+E) | Superseded by hash map of sets |
+| **Hash map of sets** | **O(V+E)** | **O(d)** | **O(1)** | **O(V+E)** | **Primary query structure** |
+| Postgres + B-tree | O(E log E) | O(log V + d) | O(log E) | O(V+E) disk | Persistence + incremental updates |
+
+Three structures, three jobs. The parser produces an edge list — simple to generate, one tuple per call expression. We bulk-insert that into Postgres for durability, with a B-tree index on the callee column for O(log n) disk lookup and incremental file invalidation. On startup, we load all rows into a hash map of sets in memory: forward index for O(1) "does A call B?" checks, reverse index for O(1) "what calls X?" lookups.
+
+Agents always hit the in-memory structure — no disk round-trip at query time. Postgres is the source of truth; memory is the hot path.
+
+---
+
+## Why This Matters for Autonomous Agents
+
+The data structure choice directly determines what the agent can afford to do inside a ReAct loop.
+
+With an edge list: `find_callers` scans 33,597 rows on every call. An agent making 5 tool calls burns through 168,000 comparisons just for caller lookups.
+
+With a hash map of sets: `find_callers` is a single dict lookup. The agent can call it freely — before every fix, for every function touched, without thinking about cost.
+
+The right data structure doesn't just make the system faster. It changes the agent's behavior by making the right action cheap. When structural certainty is free, the agent uses it. When it's expensive, the agent skips it and ships an incomplete fix.
+
+That's the real lesson from Part 1: the agent wasn't skipping caller analysis because it was lazy. It was skipping it because the only tool available (GitHub search) made complete caller analysis prohibitively expensive. Give it O(1) lookup and it uses it on every single fix.
