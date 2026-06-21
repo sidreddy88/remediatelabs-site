@@ -196,4 +196,18 @@ The fix is no longer just correct — it is complete.
 
 ---
 
+## What Breaks at Scale
+
+The current setup works well for a codebase of ~400 files and ~33k edges. Three things degrade as the codebase grows:
+
+**1. Startup rebuild time.** On server start, we load all Postgres rows into the in-memory hash map. At 33k edges this is instant. At 500k edges (a mid-size monorepo) it takes a few seconds. At 5M edges it blocks startup for 30+ seconds. The fix: rebuild in a background thread and serve a stale-but-warm graph until the rebuild completes. The agent gets slightly stale data for a few seconds after deploy rather than waiting.
+
+**2. Memory pressure.** Each edge is a `CallerInfo` object with three strings and an int. At 33k edges, the in-memory graph is negligible. At 5M edges, Python object overhead makes this 500MB+. The fix: shard by package or namespace — maintain one graph per top-level directory, load only the shard relevant to the file being patched. Most incidents touch one area of the codebase, not all of it.
+
+**3. Full re-index time.** Parsing 427 files with tree-sitter takes a few seconds. At 10,000 files it's a few minutes. The fix is already partially in place: each file's edges are stored with its path (`idx_cge_caller_file`), so we can delete and reparse only changed files. Wiring this to a PR merge webhook means the graph stays current without ever doing a full re-index after the first one.
+
+The Postgres layer is what makes all three mitigations possible — because edges are persisted with file-level granularity, you can load subsets, rebuild incrementally, and invalidate precisely. A pure in-memory graph built at startup has none of that flexibility.
+
+---
+
 *Part 2 covers the data structure decision: five ways to represent a call graph, what each costs at query time and build time, and why we ended up with a hash map of sets backed by Postgres.*
